@@ -14,6 +14,14 @@ The cranker polls on-chain state and submits whichever step is due. All instruct
 
 ### Docker
 
+The image is hosted on a private GHCR registry, so operators need a GitHub PAT with `read:packages` scope to pull it. One-time setup:
+
+```bash
+echo "$GITHUB_PAT" | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
+```
+
+Then:
+
 ```bash
 docker run -d \
   --name ar-io-cranker \
@@ -24,6 +32,8 @@ docker run -d \
   -e SOLANA_KEYPAIR_PATH=/keys/cranker.json \
   ghcr.io/ar-io/ar-io-cranker:latest
 ```
+
+The host keypair file must be readable by uid 10001 inside the container — either chmod to 644 or chown to uid 10001 on the host.
 
 ### Docker Compose / Kubernetes / systemd
 
@@ -44,7 +54,7 @@ yarn start
 
 ## Configuration
 
-All settings are environment variables. Defaults match production-mainnet usage.
+All settings are environment variables.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -93,7 +103,7 @@ Reasonable starting allocation: **1 SOL**. Alert on `cranker_wallet_balance_sol`
 
 ## Two ways to run a cranker
 
-The AR.IO observer (`ar-io-observer`) ships with a built-in cranker that gateway operators can enable with `ENABLE_EPOCH_CRANKING=true` — same algorithm, reuses the observer's keypair and connection. Both modes can run concurrently (idempotent by design); the first cranker to land each transaction wins, others get an `already_done` debug log.
+The AR.IO observer (`ar-io-observer`) ships with a built-in cranker that gateway operators can enable with `ENABLE_EPOCH_CRANKING=true` — same algorithm, reuses the observer's keypair and connection. Both modes are safe to run concurrently: each instruction is permissionless and idempotent, and the cranker adds 1–5 s of random jitter per tick so independent crankers naturally space out across pipeline steps. When two do race the same tx, one lands and the other gets an `already_done` debug log.
 
 Pick the standalone (this repo) when:
 - You're not running an observer (e.g., dedicated cranker host, foundation infrastructure)
