@@ -13,6 +13,9 @@ jobs:
     permissions:
       contents: read
       packages: read
+    env:
+      # Set at job level so yarn cache lookup in setup-node can read .npmrc
+      NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -22,8 +25,6 @@ jobs:
           cache: yarn
 
       - name: Install dependencies
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: yarn install --frozen-lockfile --non-interactive
 
       - name: Type-check
