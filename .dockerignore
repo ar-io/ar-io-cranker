@@ -4,6 +4,7 @@ dist/
 .github/
 .env
 .env.local
+.npmrc
 *.log
 .DS_Store
 keys/
