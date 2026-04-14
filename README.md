@@ -25,7 +25,14 @@ docker run -d \
   ghcr.io/ar-io/ar-io-cranker:latest
 ```
 
-### Node
+### Docker Compose / Kubernetes / systemd
+
+Reference manifests in [`deploy/`](deploy/):
+- [`deploy/docker-compose.yml`](deploy/docker-compose.yml)
+- [`deploy/k8s/`](deploy/k8s/) — Deployment, ConfigMap, Secret example, ServiceMonitor
+- [`deploy/systemd/`](deploy/systemd/) — unit file + install helper
+
+### Node (build from source)
 
 ```bash
 yarn install   # requires GitHub Packages auth — see below
@@ -74,7 +81,7 @@ Use `/health` for Kubernetes readiness probes and `/metrics` for Prometheus scra
 
 ## Wallet funding
 
-The cranker burns a small amount of SOL on every transaction (~0.01 SOL/day at default settings).
+Each cycle submits a small number of transactions per epoch (1 create + ⌈gateways/15⌉ tally + 1 prescribe + ⌈gateways/15⌉ distribute + 1 close). Actual SOL burn depends on active gateway count, priority fees, and contention with other crankers.
 
 | Threshold | Default | Action |
 |---|---|---|
@@ -82,7 +89,7 @@ The cranker burns a small amount of SOL on every transaction (~0.01 SOL/day at d
 | Critical | 0.1 SOL | `level=error` log + `/health` returns 503 |
 | Refuse start | 0.01 SOL | Cranker exits with code 3 |
 
-Recommended: alert on the `cranker_wallet_balance_sol` Prometheus gauge dropping below your warn threshold, then top up from a treasury wallet.
+Reasonable starting allocation: **1 SOL**. Alert on `cranker_wallet_balance_sol` dropping below your warn threshold and top up from a treasury wallet. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for refill patterns and Prometheus alert templates.
 
 ## Two ways to run a cranker
 

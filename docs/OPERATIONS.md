@@ -4,7 +4,14 @@ Day-to-day operations for running the cranker in production.
 
 ## Wallet funding
 
-The cranker burns ~0.01 SOL/day at default settings (1 tx every ~10 seconds × 6 epoch instructions per cycle).
+Each pipeline cycle submits a small number of transactions per epoch:
+- 1 `create_epoch`
+- ⌈active_gateways / `BATCH_SIZE`⌉ `tally_weights` batches
+- 1 `prescribe_epoch`
+- ⌈active_gateways / `BATCH_SIZE`⌉ `distribute_epoch` batches
+- 1 `close_epoch` (when an epoch ages past `EPOCH_RETENTION`)
+
+Actual SOL burn depends on active gateway count, the priority fees you set on the wallet, and how many other crankers are racing the same instructions. A reasonable starting allocation is **1 SOL** with refill alerts.
 
 | Threshold | Default | Behavior |
 |-----------|---------|----------|
@@ -12,20 +19,18 @@ The cranker burns ~0.01 SOL/day at default settings (1 tx every ~10 seconds × 6
 | Critical | 0.1 SOL | `level=error` log + `/health` returns **503** |
 | Refuse start | 0.01 SOL | Cranker exits with code 3 |
 
-Recommended: keep ~1 SOL in the cranker wallet (~100 days runway), alert at 0.3 SOL.
-
 ### Funding flow
 
-1. Generate a fresh keypair just for the cranker (don't reuse a treasury wallet):
+1. Generate a fresh keypair dedicated to the cranker (don't reuse a treasury wallet):
    ```bash
    solana-keygen new --outfile cranker-keypair.json
    ```
-2. Send 1 SOL from your treasury to the cranker's pubkey:
+2. Send SOL from your treasury to the cranker's pubkey:
    ```bash
-   solana address -k cranker-keypair.json
-   solana transfer --from treasury.json $(solana address -k cranker-keypair.json) 1
+   PUBKEY=$(solana address -k cranker-keypair.json)
+   solana transfer --from treasury.json "$PUBKEY" 1
    ```
-3. Place the keypair file with mode 0400 wherever the cranker will read it from.
+3. Place the keypair file at the path the cranker will read from. In Docker the in-container user is uid 10001, so the host file needs to be either world-readable (mode 644) or owned by uid 10001 (chown). Kubernetes Secrets handle this automatically (mode 0400 with uid 10001 via `securityContext.fsGroup`).
 
 ### Refill automation
 
@@ -150,22 +155,20 @@ The cranker is safe to stop at any time — no in-progress state is lost. Other 
 ## Troubleshooting
 
 ### Cranker stuck at "not_ready" errors
-Usually a contract precondition isn't met yet (e.g., epochs disabled, no active gateways). Check the contract state directly:
-```bash
-solana account $(solana address -k cranker.json) --url $SOLANA_RPC_URL
-```
+Usually a contract precondition isn't met yet (e.g., epochs disabled, no active gateways, epoch start time not reached). The cranker's debug logs identify which step failed and the underlying Anchor error code. Common ones:
+- `EpochsNotEnabled` (6031) → admin needs to call `set_epochs_enabled(true)` on `ario-gar`
+- `EpochNotStarted` (6032) → next epoch's start time hasn't passed yet
+- `WeightsNotTallied` (6046) → another cranker hasn't finished tallying yet
 
 ### Real errors climbing
 Check the `cranker_errors_total{type="real"}` counter and tail recent logs. Real errors usually mean RPC issues or unexpected on-chain state changes — escalate.
 
-### Wallet drained unexpectedly
+### Wallet draining faster than expected
 Possible causes:
-- RPC sending duplicate txs (check `errors_total{type="already_done"}` is high)
-- Many other crankers racing on a low-activity epoch
+- High priority fees set on the wallet
+- Many other crankers racing — check `cranker_errors_total{type="already_done"}` rate
 - Poll interval too aggressive (default 10s is fine; don't go below 5s)
+- Large active gateway count → more tally/distribute batches per epoch
 
 ### No epochs being created
-Verify:
-1. `EpochsNotEnabled` (6031) errors → admin needs to call `set_epochs_enabled(true)`
-2. `EpochNotStarted` (6032) errors → next epoch's start time hasn't passed
-3. Genesis timestamp is correct (epoch 0 won't create until `now >= genesisTimestamp`)
+Check the debug log for the underlying error code (see "Cranker stuck at not_ready errors" above) and verify the on-chain `EpochSettings` account: `enabled: true`, `genesis_timestamp` in the past, `epoch_duration` set correctly.
