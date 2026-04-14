@@ -1,0 +1,49 @@
+# AR.IO Epoch Cranker — standalone Docker Compose deployment.
+#
+# Quick start:
+#   1. Copy ../.env.example to ./.env and fill in values
+#   2. Place your funded cranker keypair JSON at ./keys/cranker.json
+#      with mode 644 so the in-container uid 10001 can read it:
+#        chmod 644 ./keys/cranker.json
+#   3. docker compose -f deploy/docker-compose.yml up -d
+#
+# Logs:    docker compose -f deploy/docker-compose.yml logs -f
+# Status:  curl http://127.0.0.1:8080/health
+# Metrics: curl http://127.0.0.1:8080/metrics
+# Stop:    docker compose -f deploy/docker-compose.yml down
+
+services:
+  cranker:
+    image: ghcr.io/ar-io/ar-io-cranker:latest
+    container_name: ar-io-cranker
+    restart: unless-stopped
+    environment:
+      SOLANA_RPC_URL: ${SOLANA_RPC_URL:?SOLANA_RPC_URL required}
+      SOLANA_KEYPAIR_PATH: /keys/cranker.json
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-10000}
+      BATCH_SIZE: ${BATCH_SIZE:-15}
+      ENABLE_CLOSE_EPOCHS: ${ENABLE_CLOSE_EPOCHS:-true}
+      EPOCH_RETENTION: ${EPOCH_RETENTION:-7}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      WARN_BALANCE_SOL: ${WARN_BALANCE_SOL:-0.3}
+      CRITICAL_BALANCE_SOL: ${CRITICAL_BALANCE_SOL:-0.1}
+      MIN_START_BALANCE_SOL: ${MIN_START_BALANCE_SOL:-0.01}
+    volumes:
+      - ${KEYPAIR_PATH:-./keys/cranker.json}:/keys/cranker.json:ro
+    ports:
+      # Health/metrics — bind to localhost only (don't expose externally)
+      - "127.0.0.1:8080:8080"
+    mem_limit: 256m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

@@ -1,0 +1,17 @@
+# Prometheus Operator ServiceMonitor — scrapes /metrics every 30s.
+# Apply only if you have prometheus-operator installed.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ar-io-cranker
+  labels:
+    app.kubernetes.io/name: ar-io-cranker
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ar-io-cranker
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

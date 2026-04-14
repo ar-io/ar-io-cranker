@@ -1,0 +1,38 @@
+[Unit]
+Description=AR.IO Network Epoch Cranker
+Documentation=https://github.com/ar-io/ar-io-cranker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ar-io-cranker
+Group=ar-io-cranker
+WorkingDirectory=/opt/ar-io-cranker
+EnvironmentFile=/etc/ar-io-cranker/cranker.env
+ExecStart=/usr/bin/node /opt/ar-io-cranker/dist/index.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ar-io-cranker
+TimeoutStopSec=15
+KillSignal=SIGTERM
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+ReadOnlyPaths=/etc/ar-io-cranker /opt/ar-io-cranker
+
+[Install]
+WantedBy=multi-user.target

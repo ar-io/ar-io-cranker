@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ar-io-cranker
+  labels:
+    app.kubernetes.io/name: ar-io-cranker
+    app.kubernetes.io/component: cranker
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ar-io-cranker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ar-io-cranker
+    spec:
+      terminationGracePeriodSeconds: 15
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cranker
+          image: ghcr.io/ar-io/ar-io-cranker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: SOLANA_KEYPAIR_PATH
+              value: /keys/cranker.json
+          envFrom:
+            - configMapRef:
+                name: ar-io-cranker-config
+          volumeMounts:
+            - name: keypair
+              mountPath: /keys
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: keypair
+          secret:
+            secretName: ar-io-cranker-keypair
+            defaultMode: 0400
+            items:
+              - key: cranker.json
+                path: cranker.json
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ar-io-cranker
+  labels:
+    app.kubernetes.io/name: ar-io-cranker
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ar-io-cranker
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

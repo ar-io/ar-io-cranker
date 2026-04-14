@@ -181,7 +181,11 @@ export class EpochStateMachine {
     try {
       settings = await this.config.getEpochSettings();
     } catch (err) {
-      log.error('Failed to read epoch settings', { error: String(err) });
+      // Route through error classifier — most failures here are transient
+      // RPC issues (fetch failed, blockhash not found) that should NOT count
+      // as real errors. handleError increments consecutiveRealErrors for
+      // genuine failures, which the health endpoint uses for readiness.
+      this.handleError(err, 'read_epoch_settings');
       return;
     }
 

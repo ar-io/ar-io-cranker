@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ar-io-cranker-config
+data:
+  SOLANA_RPC_URL: https://api.mainnet-beta.solana.com
+  POLL_INTERVAL_MS: "10000"
+  BATCH_SIZE: "15"
+  ENABLE_CLOSE_EPOCHS: "true"
+  EPOCH_RETENTION: "7"
+  LOG_LEVEL: info
+  LOG_FORMAT: json
+  WARN_BALANCE_SOL: "0.3"
+  CRITICAL_BALANCE_SOL: "0.1"
+  MIN_START_BALANCE_SOL: "0.01"
