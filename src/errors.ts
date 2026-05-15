@@ -1,5 +1,6 @@
 /**
  * Anchor error parsing and classification for epoch cranker.
+ * Mirrors ar-io-observer/src/epoch/errors.ts — keep in sync.
  *
  * Three categories:
  * - "already_done": Step was completed by another cranker. Safe to skip.
@@ -18,6 +19,24 @@ export type ErrorCategory = 'already_done' | 'not_ready' | 'real';
 const ALREADY_DONE_ERRORS = new Set<number>([
   // AlreadyInitialized (Anchor built-in) — epoch account already exists
   0,
+  // Anchor framework account-error codes that all map to the same
+  // semantic for the cranker's `close_observation` cleanup loop: the
+  // candidate Observation PDA address doesn't currently hold an
+  // Observation account, so there's nothing to close. The loop walks
+  // every registry observer; misses are expected.
+  //
+  //   3007 = AccountOwnedByWrongProgram. When the (epoch_index, observer)
+  //          PDA address has never been initialized, it's owned by the
+  //          System Program (`11111...`), not ario-gar. Anchor's
+  //          `Account<Observation>` check raises this. **This is what
+  //          devnet produces in practice** (confirmed via
+  //          `custom program error: 0xbbf` in failed simulations).
+  //   3012 = AccountNotInitialized. Defensive: a slightly different
+  //          path where the account exists but has zero data could
+  //          surface this. Semantically equivalent to "nothing to
+  //          close."
+  3007,
+  3012,
   // RewardsAlreadyDistributed (variant 37)
   6037,
   // EpochAlreadyExists (variant 41)
@@ -46,29 +65,60 @@ const NOT_READY_ERRORS = new Set<number>([
 ]);
 
 /**
- * Parse Anchor error code from a Solana transaction error.
- * Anchor logs errors as: "Program log: AnchorError occurred. Error Code: ... Error Number: XXXX."
+ * Walk the `cause` chain on a thrown error and concatenate every
+ * message + every `context.logs[]` (kit packs the program logs there)
+ * so the regex extractors below can find the Anchor code.
+ *
+ * The SDK's `sendAndConfirm` throws a `SolanaError` whose top-level
+ * `message` is just `"Transaction simulation failed"`. The actual
+ * `custom program error: 0xNNN` line and the `Error Number: NNNN`
+ * AnchorError text live one or two levels down in `cause.context.logs`
+ * and `cause.message`. Reading only the top-level message misses
+ * everything useful.
  */
+function collectErrorText(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; current != null && depth < 10; depth++) {
+    if (typeof current === 'string') {
+      parts.push(current);
+      break;
+    }
+    if (current instanceof Error || typeof current === 'object') {
+      const e = current as {
+        message?: string;
+        context?: { logs?: string[]; err?: unknown };
+        cause?: unknown;
+      };
+      if (e.message) parts.push(e.message);
+      if (Array.isArray(e.context?.logs)) parts.push(e.context.logs.join('\n'));
+      if (e.context?.err && typeof e.context.err === 'object') {
+        // kit packs `{ InstructionError: [idx, {Custom: N}] }` here
+        try {
+          parts.push(JSON.stringify(e.context.err));
+        } catch {
+          /* ignore circular */
+        }
+      }
+      current = e.cause;
+    } else {
+      break;
+    }
+  }
+  return parts.join('\n');
+}
+
 export function parseAnchorErrorCode(error: unknown): number | null {
-  const msg = error instanceof Error ? error.message : String(error);
-
-  // Match "Error Number: XXXX" pattern from Anchor logs
+  const msg = collectErrorText(error);
   const match = msg.match(/Error Number: (\d+)/);
-  if (match) {
-    return parseInt(match[1]);
-  }
-
-  // Also check for "custom program error: 0xXXXX" pattern
+  if (match) return parseInt(match[1]);
   const hexMatch = msg.match(/custom program error: 0x([0-9a-fA-F]+)/);
-  if (hexMatch) {
-    return parseInt(hexMatch[1], 16);
-  }
-
-  // Check for "already in use" (Anchor init constraint — account already exists)
-  if (msg.includes('already in use')) {
-    return 0;
-  }
-
+  if (hexMatch) return parseInt(hexMatch[1], 16);
+  // kit's structured `InstructionError: [idx, {Custom: NNNN}]` form
+  // (decimal, JSON-stringified from the `context.err` field).
+  const customMatch = msg.match(/"Custom":\s*(\d+)/);
+  if (customMatch) return parseInt(customMatch[1]);
+  if (msg.includes('already in use')) return 0;
   return null;
 }
 
@@ -81,7 +131,9 @@ export function classifyError(error: unknown): ErrorCategory {
 
   // RPC-level dedup: Solana returns this when another signer has already
   // submitted an identical tx (multiple crankers racing). Safe to ignore.
-  const msg = error instanceof Error ? error.message : String(error);
+  // Walk the cause chain so we catch it whether it's at the top-level
+  // message or nested inside a `SolanaError`.
+  const msg = collectErrorText(error);
   if (msg.includes('already been processed') || msg.includes('AlreadyProcessed')) {
     return 'already_done';
   }
@@ -94,7 +146,18 @@ export function classifyError(error: unknown): ErrorCategory {
     msg.includes('fetch failed') ||
     msg.includes('Connection terminated') ||
     msg.includes('ECONNRESET') ||
-    msg.includes('ETIMEDOUT')
+    msg.includes('ETIMEDOUT') ||
+    // RPC provider rate-limit responses. QuickNode / Helius / Triton
+    // return HTTP 429 with a `Too Many Requests` body when the
+    // per-second or per-month quota is hit. Cranker + observer cycles
+    // burst at epoch boundaries (cleanup + tally + distribute fire
+    // together) and routinely trip free-tier limits. Categorising as
+    // transient avoids `error:` spam; the cleanup loop will retry on
+    // the next cycle.
+    msg.includes('HTTP error (429)') ||
+    msg.includes('Too Many Requests') ||
+    msg.includes('rate limit') ||
+    msg.includes('rate-limited')
   ) {
     return 'not_ready';
   }

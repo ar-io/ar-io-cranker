@@ -15,10 +15,17 @@
  */
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
+import {
+  address,
+  createKeyPairSignerFromBytes,
+  createSolanaRpc,
+  createSolanaRpcSubscriptions,
+} from '@solana/kit';
 import { loadConfig, type CrankerConfig } from './config.js';
 import { EpochStateMachine, type CrankerLogger, type EpochSettings } from './state-machine.js';
 import { startHealthServer, type CrankerMetrics } from './health.js';
+
+const LAMPORTS_PER_SOL = 1_000_000_000;
 
 const require = createRequire(import.meta.url);
 
@@ -75,13 +82,13 @@ Endpoints (health server):
 `);
 }
 
-// SDK static imports — types come from the installed @ar-io/sdk package.
+// SDK static imports — types come from the installed @ar.io/sdk package.
 import {
   SolanaARIOWriteable,
   deserializeEpochSettingsFull,
   getEpochSettingsPDA,
   getArnsRegistryPDA,
-} from '@ar-io/sdk/solana';
+} from '@ar.io/sdk/solana';
 
 // --- Logger ---
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
@@ -176,16 +183,24 @@ async function main() {
     });
     process.exit(2);
   }
-  const signer = Keypair.fromSecretKey(Uint8Array.from(keypairData));
-  log.info('Wallet loaded', { publicKey: signer.publicKey.toBase58() });
+  const signer = await createKeyPairSignerFromBytes(
+    Uint8Array.from(keypairData),
+  );
+  log.info('Wallet loaded', { address: signer.address });
 
-  // Create connection
-  const connection = new Connection(config.solanaRpcUrl, 'confirmed');
+  // Create RPC client (kit replaces web3.js's Connection).
+  const rpc = createSolanaRpc(config.solanaRpcUrl);
+  // The SDK's `SolanaARIOWriteable` needs an RPC subscriptions client
+  // to confirm transactions via `sendAndConfirm`. Derive the websocket
+  // URL from the configured HTTPS RPC by swapping the scheme — matches
+  // observer/src/system.ts:160.
+  const wsUrl = config.solanaRpcUrl.replace(/^http/, 'ws');
+  const rpcSubscriptions = createSolanaRpcSubscriptions(wsUrl);
 
   // Pre-flight: check wallet balance meets minimum required to start
   try {
-    const balance = await connection.getBalance(signer.publicKey);
-    const sol = balance / LAMPORTS_PER_SOL;
+    const { value } = await rpc.getBalance(signer.address).send();
+    const sol = Number(value) / LAMPORTS_PER_SOL;
     log.info('Wallet balance', { balanceSol: sol.toFixed(4) });
     if (sol < config.minStartBalanceSol) {
       log.error('Wallet balance below MIN_START_BALANCE_SOL — refusing to start', {
@@ -201,27 +216,43 @@ async function main() {
   }
 
   // Program ID overrides (for localnet/devnet — source from localnet.env)
-  const coreProgramId = config.coreProgramId ? new PublicKey(config.coreProgramId) : undefined;
-  const garProgramId = config.garProgramId ? new PublicKey(config.garProgramId) : undefined;
-  const arnsProgramId = config.arnsProgramId ? new PublicKey(config.arnsProgramId) : undefined;
+  const coreProgramId = config.coreProgramId ? address(config.coreProgramId) : undefined;
+  const garProgramId = config.garProgramId ? address(config.garProgramId) : undefined;
+  const arnsProgramId = config.arnsProgramId ? address(config.arnsProgramId) : undefined;
 
   if (coreProgramId || garProgramId || arnsProgramId) {
     log.info('Using custom program IDs', {
-      core: coreProgramId?.toBase58(),
-      gar: garProgramId?.toBase58(),
-      arns: arnsProgramId?.toBase58(),
+      core: coreProgramId,
+      gar: garProgramId,
+      arns: arnsProgramId,
     });
   }
 
-  // Create SDK client
-  const contract = new SolanaARIOWriteable({ connection, signer, coreProgramId, garProgramId, arnsProgramId });
+  // Create SDK client (kit-style: pass `rpc` not `connection`).
+  // The `as any` cast on `rpc` mirrors ar-io-node's on-demand-arns-resolver:
+  // `@ar.io/sdk` and `@solana/kit` each ship their own nested copy of
+  // `@solana/rpc-spec`, so the structural types don't unify even though
+  // the underlying runtime objects are interchangeable.
+  const contract = new SolanaARIOWriteable({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    rpc: rpc as any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    rpcSubscriptions: rpcSubscriptions as any,
+    signer,
+    coreProgramId,
+    garProgramId,
+    arnsProgramId,
+  });
 
   // Epoch settings reader
   const readEpochSettings = async (): Promise<EpochSettings> => {
-    const [pda] = getEpochSettingsPDA(garProgramId);
-    const account = await connection.getAccountInfo(pda, { commitment: 'confirmed' });
-    if (!account) throw new Error('EpochSettings not found');
-    const data = deserializeEpochSettingsFull(account.data as Buffer);
+    const [pda] = await getEpochSettingsPDA(garProgramId);
+    const accountResp = await rpc
+      .getAccountInfo(pda, { commitment: 'confirmed', encoding: 'base64' })
+      .send();
+    if (!accountResp.value) throw new Error('EpochSettings not found');
+    const dataB64 = accountResp.value.data[0]; // [base64, "base64"]
+    const data = deserializeEpochSettingsFull(Buffer.from(dataB64, 'base64'));
     return {
       currentEpochIndex: data.currentEpochIndex as number,
       genesisTimestamp: data.genesisTimestamp as number,
@@ -231,13 +262,13 @@ async function main() {
   };
 
   // Derive NameRegistry PDA for name prescription
-  const [nameRegistryPda] = getArnsRegistryPDA(arnsProgramId);
+  const [nameRegistryPda] = await getArnsRegistryPDA(arnsProgramId);
 
   // Create state machine
   const startTime = Date.now();
   const stateMachine = new EpochStateMachine({
     contract,
-    connection,
+    rpc,
     signer,
     pollIntervalMs: config.pollIntervalMs,
     batchSize: config.batchSize,
