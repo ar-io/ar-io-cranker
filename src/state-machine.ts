@@ -7,8 +7,10 @@
  * Each poll cycle reads on-chain state and executes the next required step.
  * All instructions are idempotent — safe to run multiple crankers concurrently.
  */
-import { Connection, Keypair, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import type { Address, Rpc, SolanaRpcApi, TransactionSigner } from '@solana/kit';
 import { classifyError, type ErrorCategory } from './errors.js';
+
+const LAMPORTS_PER_SOL = 1_000_000_000;
 
 // We import the SDK's SolanaARIOWriteable which has all the epoch methods.
 // In standalone mode, the cranker instantiates this directly.
@@ -18,12 +20,12 @@ import { classifyError, type ErrorCategory } from './errors.js';
 // build artifacts. The actual object passed in must have these methods.
 export interface EpochCrankerContract {
   createEpoch(): Promise<{ id: string }>;
-  tallyWeights(params: { epochIndex: number; gatewayAccounts: PublicKey[] }): Promise<{ id: string }>;
-  prescribeEpoch(params: { epochIndex: number; gatewayAccounts: PublicKey[]; nameRegistryAccount?: PublicKey }): Promise<{ id: string }>;
-  distributeEpoch(params: { epochIndex: number; gatewayAccounts: PublicKey[] }): Promise<{ id: string }>;
+  tallyWeights(params: { epochIndex: number; gatewayAccounts: Address[] }): Promise<{ id: string }>;
+  prescribeEpoch(params: { epochIndex: number; gatewayAccounts: Address[]; nameRegistryAccount?: Address }): Promise<{ id: string }>;
+  distributeEpoch(params: { epochIndex: number; gatewayAccounts: Address[] }): Promise<{ id: string }>;
   closeEpoch(params: { epochIndex: number }): Promise<{ id: string }>;
-  getRegistryGatewayPDAs(startIndex: number, batchSize: number): Promise<PublicKey[]>;
-  getAllRegistryGatewayPDAs(): Promise<PublicKey[]>;
+  getRegistryGatewayPDAs(startIndex: number, batchSize: number): Promise<Address[]>;
+  getAllRegistryGatewayPDAs(): Promise<Address[]>;
   getEpochRaw(epochIndex: number): Promise<{
     tallyIndex: number;
     distributionIndex: number;
@@ -51,8 +53,8 @@ export interface CrankerLogger {
 
 export interface StateMachineConfig {
   contract: EpochCrankerContract;
-  connection: Connection;
-  signer: Keypair;
+  rpc: Rpc<SolanaRpcApi>;
+  signer: TransactionSigner;
   pollIntervalMs: number;
   batchSize: number;
   enableCloseEpochs: boolean;
@@ -66,7 +68,7 @@ export interface StateMachineConfig {
   /** Callback to read epoch settings from chain */
   getEpochSettings: () => Promise<EpochSettings>;
   /** NameRegistry PDA — pass to enable name prescription during prescribeEpoch */
-  nameRegistryAccount?: PublicKey;
+  nameRegistryAccount?: Address;
 }
 
 export interface StateMachineMetrics {
@@ -401,10 +403,11 @@ export class EpochStateMachine {
 
   private async updateWalletBalance(): Promise<void> {
     try {
-      const balance = await this.config.connection.getBalance(
-        this.config.signer.publicKey,
-      );
-      const sol = balance / LAMPORTS_PER_SOL;
+      // @solana/kit returns `{ value: bigint }` from getBalance.
+      const { value } = await this.config.rpc
+        .getBalance(this.config.signer.address)
+        .send();
+      const sol = Number(value) / LAMPORTS_PER_SOL;
       this.metrics.walletBalanceSol = sol.toFixed(4);
 
       const warnThreshold = this.config.warnBalanceSol ?? 0.3;
@@ -415,13 +418,13 @@ export class EpochStateMachine {
         this.config.log.error('Wallet balance CRITICAL — cranker will halt soon', {
           balanceSol: sol.toFixed(4),
           critical: criticalThreshold,
-          publicKey: this.config.signer.publicKey.toBase58(),
+          address: this.config.signer.address,
         });
       } else if (sol < warnThreshold) {
         this.config.log.warn('Wallet balance low — top up soon', {
           balanceSol: sol.toFixed(4),
           warn: warnThreshold,
-          publicKey: this.config.signer.publicKey.toBase58(),
+          address: this.config.signer.address,
         });
       }
     } catch {
