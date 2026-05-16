@@ -69,6 +69,17 @@ export interface StateMachineConfig {
   getEpochSettings: () => Promise<EpochSettings>;
   /** NameRegistry PDA — pass to enable name prescription during prescribeEpoch */
   nameRegistryAccount?: Address;
+  // --- Permissionless cleanup loop (mirrors ar-io-observer/src/epoch/epoch-cranker.ts). ---
+  /** Master toggle for the cleanup pass. Default true. */
+  enableCleanup?: boolean;
+  /** Minimum interval between cleanup passes. Default 300_000 ms (5 min). */
+  cleanupMinIntervalMs?: number;
+  /** Batch size for ArNS record / returned-name pruning. Default 15. */
+  cleanupBatchSize?: number;
+  /** Per-cycle tx cap across all cleanup sub-phases. Default 50. */
+  maxCleanupTxsPerCycle?: number;
+  /** Consecutive failed observations before a gateway becomes prune-eligible. Default 30. */
+  cleanupFailureThreshold?: number;
 }
 
 export interface StateMachineMetrics {
@@ -89,6 +100,9 @@ export interface StateMachineMetrics {
   errorsNotReady: number;
   errorsReal: number;
   consecutiveRealErrors: number;
+  cleanupTxsLastCycle: number;
+  cleanupTxsTotal: number;
+  lastCleanupTime: string;
 }
 
 export class EpochStateMachine {
@@ -116,7 +130,14 @@ export class EpochStateMachine {
     errorsNotReady: 0,
     errorsReal: 0,
     consecutiveRealErrors: 0,
+    cleanupTxsLastCycle: 0,
+    cleanupTxsTotal: 0,
+    lastCleanupTime: '',
   };
+
+  // Timestamp of the last cleanup pass — used to throttle the cleanup
+  // sub-pipeline to at most once per `cleanupMinIntervalMs`.
+  private lastCleanupRunMs = 0;
 
   constructor(config: StateMachineConfig) {
     this.config = config;
@@ -374,6 +395,253 @@ export class EpochStateMachine {
     // 10. All done for this epoch, waiting for next one to be due
     this.metrics.phase = 'idle';
     log.debug('Epoch cycle complete', { epochIndex: targetEpochIndex });
+
+    // 11. Permissionless prune / cleanup (best-effort, throttled).
+    // Runs only after the pipeline reaches its quiescent tail; never blocks
+    // an epoch step. Errors here are isolated — handleError logs but the
+    // outer tick() exits cleanly.
+    if (this.config.enableCleanup !== false) {
+      const minInterval = this.config.cleanupMinIntervalMs ?? 300_000;
+      const elapsed = Date.now() - this.lastCleanupRunMs;
+      if (elapsed >= minInterval) {
+        this.lastCleanupRunMs = Date.now();
+        try {
+          await this.runCleanup(targetEpochIndex);
+        } catch (err) {
+          this.handleError(err, 'cleanup');
+        }
+      }
+    }
+  }
+
+  /**
+   * Permissionless prune / cleanup pass — mirrors
+   * ar-io-observer/src/epoch/epoch-cranker.ts::runCleanup. All sub-steps
+   * are best-effort. A per-cycle tx budget across the 6 phases prevents
+   * a pathological discovery from burning fees on a single cycle.
+   *
+   * Methods consumed here are on `SolanaARIOWriteable` (in @ar.io/sdk's
+   * solana entrypoint) but are not in the cranker's narrow
+   * `EpochCrankerContract` facade — cast `as any` to access them. If you
+   * want stricter typing, extend the facade.
+   */
+  private async runCleanup(currentEpochIndex: number): Promise<void> {
+    const { contract, log } = this.config;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ario = contract as any;
+    const batchSize = this.config.cleanupBatchSize ?? 15;
+    const maxTxs = this.config.maxCleanupTxsPerCycle ?? 50;
+    const failureThreshold = this.config.cleanupFailureThreshold ?? 30;
+    const now = Math.floor(Date.now() / 1000);
+
+    // Mutable budget — every successful submission decrements; sub-steps
+    // exit early when it hits 0.
+    const budget = { remaining: maxTxs };
+
+    log.debug('Cleanup cycle starting', {
+      maxTxs,
+      batchSize,
+      failureThreshold,
+    });
+
+    // Phase 1: ArNS expired records — gated on `next_records_prune_timestamp`.
+    if (budget.remaining > 0) {
+      try {
+        const cfg = await ario.getArnsConfigRaw();
+        if (cfg && Number(cfg.nextRecordsPruneTimestamp) <= now) {
+          const expired = await ario.getExpiredArnsRecords(now);
+          while (expired.length > 0 && budget.remaining > 0) {
+            const batch = expired
+              .splice(0, batchSize)
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              .map((r: any) => r.pubkey);
+            try {
+              await ario.pruneExpiredNames({
+                maxNames: batch.length,
+                arnsRecords: batch,
+              });
+              budget.remaining--;
+              log.info('Pruned expired ArnsRecords', { count: batch.length });
+            } catch (err) {
+              this.handleError(err, 'prune_expired_names');
+              break;
+            }
+          }
+        }
+      } catch (err) {
+        this.handleError(err, 'cleanup_arns_records_scan');
+      }
+    }
+
+    // Phase 2: ArNS expired returned names — gated on `next_returned_names_prune_timestamp`.
+    if (budget.remaining > 0) {
+      try {
+        const cfg = await ario.getArnsConfigRaw();
+        if (cfg && Number(cfg.nextReturnedNamesPruneTimestamp) <= now) {
+          const expired = await ario.getExpiredReturnedNames(now);
+          while (expired.length > 0 && budget.remaining > 0) {
+            const batch = expired
+              .splice(0, batchSize)
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              .map((r: any) => r.pubkey);
+            try {
+              await ario.pruneReturnedNames({
+                maxNames: batch.length,
+                returnedNames: batch,
+              });
+              budget.remaining--;
+              log.info('Pruned expired ReturnedNames', { count: batch.length });
+            } catch (err) {
+              this.handleError(err, 'prune_returned_names');
+              break;
+            }
+          }
+        }
+      } catch (err) {
+        this.handleError(err, 'cleanup_returned_names_scan');
+      }
+    }
+
+    // Phase 3: Deficient gateways → prune_gateway, plus Gone gateways → finalize_gone.
+    if (budget.remaining > 0) {
+      try {
+        const deficient = await ario.getDeficientGateways(failureThreshold);
+        for (const g of deficient) {
+          if (budget.remaining <= 0) break;
+          try {
+            await ario.pruneGateway({ gateway: g.operator });
+            budget.remaining--;
+            log.info('Pruned deficient gateway', {
+              operator: g.operator,
+              failedConsecutive: g.failedConsecutive,
+            });
+          } catch (err) {
+            this.handleError(err, 'prune_gateway');
+          }
+        }
+      } catch (err) {
+        this.handleError(err, 'cleanup_deficient_gateways_scan');
+      }
+    }
+    if (budget.remaining > 0) {
+      try {
+        const gone = await ario.getGoneGateways();
+        for (const g of gone) {
+          if (budget.remaining <= 0) break;
+          try {
+            await ario.finalizeGone({ gateway: g.operator });
+            budget.remaining--;
+            log.info('Finalized gone gateway', { operator: g.operator });
+          } catch (err) {
+            this.handleError(err, 'finalize_gone');
+          }
+        }
+      } catch (err) {
+        this.handleError(err, 'cleanup_gone_gateways_scan');
+      }
+    }
+
+    // Phase 4: Close old observations from epochs older than
+    // `currentEpochIndex - retention`. The Observation PDA seed is
+    // `(epochIndex, observer)`. We need the observer addresses — easiest
+    // source is the active GatewayRegistry. Observers not in the current
+    // registry won't be found; `closeObservation` no-ops on missing PDAs
+    // (Anchor returns AccountNotInitialized / AccountOwnedByWrongProgram,
+    // both classified as `already_done`).
+    const retention = this.config.epochRetention ?? 7;
+    if (budget.remaining > 0 && currentEpochIndex >= retention + 1) {
+      try {
+        const observerAddrs = await ario.getRegistryGatewayAddresses?.();
+        const closeTarget = currentEpochIndex - retention - 1;
+        if (Array.isArray(observerAddrs)) {
+          for (const observer of observerAddrs) {
+            if (budget.remaining <= 0) break;
+            try {
+              await ario.closeObservation({
+                epochIndex: closeTarget,
+                observer,
+              });
+              budget.remaining--;
+            } catch (err) {
+              const cat = this.handleError(err, 'close_observation');
+              if (cat === 'real') break;
+            }
+          }
+        }
+      } catch (err) {
+        this.handleError(err, 'cleanup_observations_scan');
+      }
+    }
+
+    // Phase 5: Dust accounts — empty Delegations + drained Withdrawals.
+    if (budget.remaining > 0) {
+      try {
+        const empty = await ario.getEmptyDelegations();
+        for (const d of empty) {
+          if (budget.remaining <= 0) break;
+          try {
+            await ario.closeEmptyDelegation({
+              gateway: d.gateway,
+              delegator: d.delegator,
+            });
+            budget.remaining--;
+          } catch (err) {
+            this.handleError(err, 'close_empty_delegation');
+          }
+        }
+      } catch (err) {
+        this.handleError(err, 'cleanup_empty_delegations_scan');
+      }
+    }
+    if (budget.remaining > 0) {
+      try {
+        const drained = await ario.getDrainedWithdrawals();
+        for (const w of drained) {
+          if (budget.remaining <= 0) break;
+          try {
+            await ario.closeDrainedWithdrawal({
+              owner: w.owner,
+              withdrawalId: w.withdrawalId,
+            });
+            budget.remaining--;
+          } catch (err) {
+            this.handleError(err, 'close_drained_withdrawal');
+          }
+        }
+      } catch (err) {
+        this.handleError(err, 'cleanup_drained_withdrawals_scan');
+      }
+    }
+
+    // Phase 6: Expired primary-name requests. Skipping `releaseVault` —
+    // it requires `owner: Signer`, so the cranker can only release its
+    // own vaults. Users have a strong incentive to call release_vault
+    // themselves (it returns their tokens).
+    if (budget.remaining > 0) {
+      try {
+        const expired = await ario.getExpiredPrimaryNameRequests(now);
+        for (const r of expired) {
+          if (budget.remaining <= 0) break;
+          try {
+            await ario.closeExpiredRequest({ initiator: r.initiator });
+            budget.remaining--;
+          } catch (err) {
+            this.handleError(err, 'close_expired_request');
+          }
+        }
+      } catch (err) {
+        this.handleError(err, 'cleanup_expired_requests_scan');
+      }
+    }
+
+    const txsSubmitted = maxTxs - budget.remaining;
+    this.metrics.cleanupTxsLastCycle = txsSubmitted;
+    this.metrics.cleanupTxsTotal += txsSubmitted;
+    this.metrics.lastCleanupTime = new Date().toISOString();
+    log.debug('Cleanup cycle complete', {
+      txsSubmitted,
+      remainingBudget: budget.remaining,
+    });
   }
 
   private handleError(error: unknown, context: string): ErrorCategory {

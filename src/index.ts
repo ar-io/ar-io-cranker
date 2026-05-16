@@ -75,6 +75,13 @@ Optional env vars:
   ARIO_GAR_PROGRAM_ID         Override GAR program ID
   ARIO_ARNS_PROGRAM_ID        Override ArNS program ID
 
+Permissionless cleanup loop (mirrors ar-io-observer's runCleanup):
+  ENABLE_CLEANUP              Master toggle (default true)
+  CLEANUP_MIN_INTERVAL_MS     Minimum ms between cleanup passes (default 300000 = 5min)
+  CLEANUP_BATCH_SIZE          Batch size for ArNS-record / returned-name pruning (default 15)
+  MAX_CLEANUP_TXS_PER_CYCLE   Per-cycle tx cap across all cleanup sub-phases (default 50)
+  CLEANUP_FAILURE_THRESHOLD   Consecutive failed observations before a gateway becomes prune-eligible (default 30)
+
 Endpoints (health server):
   GET /health                 Operational status (200 ok, 503 unhealthy)
   GET /metrics                Prometheus metrics
@@ -279,6 +286,11 @@ async function main() {
     log,
     getEpochSettings: readEpochSettings,
     nameRegistryAccount: nameRegistryPda,
+    enableCleanup: config.enableCleanup,
+    cleanupMinIntervalMs: config.cleanupMinIntervalMs,
+    cleanupBatchSize: config.cleanupBatchSize,
+    maxCleanupTxsPerCycle: config.maxCleanupTxsPerCycle,
+    cleanupFailureThreshold: config.cleanupFailureThreshold,
   });
 
   // Start health server — mark unhealthy if tick hasn't run in 3x the poll interval
