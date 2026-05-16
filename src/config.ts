@@ -27,6 +27,17 @@ export interface CrankerConfig {
   coreProgramId?: string;
   garProgramId?: string;
   arnsProgramId?: string;
+  // --- Permissionless cleanup loop (see state-machine.ts:runCleanup) ---
+  /** Master toggle for the cleanup pass. Default true. */
+  enableCleanup: boolean;
+  /** Minimum interval between cleanup passes (ms). Default 300000 = 5 min. */
+  cleanupMinIntervalMs: number;
+  /** Batch size for ArNS-record / returned-name pruning. Default 15. */
+  cleanupBatchSize: number;
+  /** Per-cycle tx cap across all cleanup sub-phases. Default 50. */
+  maxCleanupTxsPerCycle: number;
+  /** Consecutive failed observations before a gateway is prune-eligible. Default 30. */
+  cleanupFailureThreshold: number;
 }
 
 function envOrDefault(key: string, defaultValue: string): string {
@@ -95,5 +106,10 @@ export function loadConfig(): CrankerConfig {
     coreProgramId: process.env['ARIO_CORE_PROGRAM_ID'] || undefined,
     garProgramId: process.env['ARIO_GAR_PROGRAM_ID'] || undefined,
     arnsProgramId: process.env['ARIO_ARNS_PROGRAM_ID'] || undefined,
+    enableCleanup: envOrDefault('ENABLE_CLEANUP', 'true') === 'true',
+    cleanupMinIntervalMs: parseIntEnv('CLEANUP_MIN_INTERVAL_MS', '300000', 30_000),
+    cleanupBatchSize: parseIntEnv('CLEANUP_BATCH_SIZE', '15', 1, 100),
+    maxCleanupTxsPerCycle: parseIntEnv('MAX_CLEANUP_TXS_PER_CYCLE', '50', 1, 500),
+    cleanupFailureThreshold: parseIntEnv('CLEANUP_FAILURE_THRESHOLD', '30', 1),
   };
 }
