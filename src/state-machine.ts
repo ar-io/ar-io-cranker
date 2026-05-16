@@ -389,10 +389,12 @@ export class EpochStateMachine {
           log.debug('Epoch already created — will process on next tick');
         }
       }
-      return;
     }
 
-    // 10. All done for this epoch, waiting for next one to be due
+    // 10. Tick reached its quiescent tail. Fall through so the throttled
+    // cleanup block below has a chance to run on every tick that completes
+    // its main pipeline work. Mirrors observer's epoch-cranker.ts:280–292,
+    // which also does not early-return after create_epoch.
     this.metrics.phase = 'idle';
     log.debug('Epoch cycle complete', { epochIndex: targetEpochIndex });
 
