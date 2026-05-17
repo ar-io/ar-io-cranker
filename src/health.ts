@@ -27,6 +27,9 @@ export interface CrankerMetrics {
   errorsNotReady: number;
   errorsReal: number;
   consecutiveRealErrors: number;
+  cleanupTxsLastCycle: number;
+  cleanupTxsTotal: number;
+  lastCleanupTime: string;
 }
 
 export interface HealthServerConfig {
@@ -93,6 +96,9 @@ export function startHealthServer(cfg: HealthServerConfig): http.Server {
         walletBalanceCritical: m.walletBalanceCritical,
         consecutiveRealErrors: m.consecutiveRealErrors,
         uptimeSeconds: m.uptimeSeconds,
+        cleanupTxsLastCycle: m.cleanupTxsLastCycle,
+        cleanupTxsTotal: m.cleanupTxsTotal,
+        lastCleanupTime: m.lastCleanupTime || null,
       }));
     } else if (url === '/metrics') {
       const m = cfg.getMetrics();
@@ -136,6 +142,15 @@ export function startHealthServer(cfg: HealthServerConfig): http.Server {
         `# HELP cranker_last_tick_timestamp_seconds Unix timestamp of last tick`,
         `# TYPE cranker_last_tick_timestamp_seconds gauge`,
         `cranker_last_tick_timestamp_seconds ${m.lastTickTime ? Math.floor(Date.parse(m.lastTickTime) / 1000) : 0}`,
+        `# HELP cranker_cleanup_txs_total Total cleanup txs submitted across all cycles`,
+        `# TYPE cranker_cleanup_txs_total counter`,
+        `cranker_cleanup_txs_total ${m.cleanupTxsTotal}`,
+        `# HELP cranker_cleanup_txs_last_cycle Cleanup txs submitted in the most recent cycle`,
+        `# TYPE cranker_cleanup_txs_last_cycle gauge`,
+        `cranker_cleanup_txs_last_cycle ${m.cleanupTxsLastCycle}`,
+        `# HELP cranker_last_cleanup_timestamp_seconds Unix timestamp of last completed cleanup cycle (0 if none yet)`,
+        `# TYPE cranker_last_cleanup_timestamp_seconds gauge`,
+        `cranker_last_cleanup_timestamp_seconds ${m.lastCleanupTime ? Math.floor(Date.parse(m.lastCleanupTime) / 1000) : 0}`,
         '',
       ].join('\n'));
     } else if (url === '/') {
