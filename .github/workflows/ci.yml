@@ -14,7 +14,7 @@ jobs:
       contents: read
       packages: read
     env:
-      # Set at job level so yarn cache lookup in setup-node can read .npmrc
+      # Set at job level so npm cache lookup in setup-node can read .npmrc
       NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
@@ -22,16 +22,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: yarn
+          cache: npm
 
       - name: Install dependencies
-        run: yarn install --frozen-lockfile --non-interactive
+        run: npm ci --no-audit --no-fund
 
       - name: Type-check
-        run: yarn typecheck
+        run: npm run typecheck
 
       - name: Build
-        run: yarn build
+        run: npm run build
 
       - name: Verify CLI
         run: |

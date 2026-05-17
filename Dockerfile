@@ -23,31 +23,28 @@
 FROM node:20-bookworm-slim AS builder
 WORKDIR /build
 
-COPY package.json yarn.lock ./
+COPY package.json package-lock.json ./
 
-# Helper to write a fully-substituted .npmrc for a single yarn install
-# then delete it. Yarn evaluates ${VAR} in .npmrc on every invocation,
-# so leaving an unsubstituted template would break later RUN steps that
-# don't have the secret mounted (e.g. `yarn build`, which loads .npmrc
-# even though it never hits the registry).
+# Write a fully-substituted .npmrc for the install, then delete it so the
+# auth token never lands in a layer.
 
 # Install ALL deps (including dev) to build TypeScript.
 RUN --mount=type=secret,id=node_auth_token \
     TOKEN=$(cat /run/secrets/node_auth_token) && \
     printf '@ar-io:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=%s\n' "$TOKEN" > .npmrc && \
-    yarn install --frozen-lockfile --non-interactive && \
+    npm ci --no-audit --no-fund && \
     rm -f .npmrc
 
 COPY tsconfig.json ./
 COPY src ./src
-RUN yarn build
+RUN npm run build
 
-# Re-install with --production to drop dev dependencies for the runtime stage.
+# Re-install omitting dev dependencies for the runtime stage.
 RUN --mount=type=secret,id=node_auth_token \
     TOKEN=$(cat /run/secrets/node_auth_token) && \
     printf '@ar-io:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=%s\n' "$TOKEN" > .npmrc && \
     rm -rf node_modules && \
-    yarn install --frozen-lockfile --non-interactive --production --ignore-scripts && \
+    npm ci --no-audit --no-fund --omit=dev --ignore-scripts && \
     rm -f .npmrc
 
 # ---------- runtime ----------
