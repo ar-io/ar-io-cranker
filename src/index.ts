@@ -95,7 +95,7 @@ import {
   deserializeEpochSettingsFull,
   getEpochSettingsPDA,
   getArnsRegistryPDA,
-} from '@ar.io/sdk/solana';
+} from '@ar.io/sdk';
 
 // --- Logger ---
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
