@@ -18,23 +18,32 @@ const LAMPORTS_PER_SOL = 1_000_000_000;
 //
 // The type is defined inline here to avoid a direct import dependency on the SDK
 // build artifacts. The actual object passed in must have these methods.
+/** Result of one `SolanaARIOWriteable.crankEpochStep()` call (mirrors @ar.io/sdk). */
+export interface CrankEpochStepResult {
+  action: 'create' | 'tally' | 'prescribe' | 'distribute' | 'close' | 'idle';
+  epochIndex?: number;
+  txId?: string;
+  progress?: { index: number; total: number };
+  reason?: string;
+}
+
+/**
+ * The subset of @ar.io/sdk's `SolanaARIOWriteable` this state machine drives.
+ *
+ * `crankEpochStep` owns the entire create → tally → prescribe → distribute →
+ * close lifecycle — including the size-safe prescribe prediction
+ * (`getPredictedObserverPDAs`, ≤50 PDAs, never the whole registry) and the
+ * `InvalidGatewayAccount` re-predict-and-retry. The cranker only schedules it
+ * and maps the result to metrics/logging. (The permissionless cleanup pass
+ * still reaches the broader SDK surface via an `as any` cast in `runCleanup`.)
+ */
 export interface EpochCrankerContract {
-  createEpoch(): Promise<{ id: string }>;
-  tallyWeights(params: { epochIndex: number; gatewayAccounts: Address[] }): Promise<{ id: string }>;
-  prescribeEpoch(params: { epochIndex: number; gatewayAccounts: Address[]; nameRegistryAccount?: Address }): Promise<{ id: string }>;
-  distributeEpoch(params: { epochIndex: number; gatewayAccounts: Address[] }): Promise<{ id: string }>;
-  closeEpoch(params: { epochIndex: number }): Promise<{ id: string }>;
-  getRegistryGatewayPDAs(startIndex: number, batchSize: number): Promise<Address[]>;
-  getAllRegistryGatewayPDAs(): Promise<Address[]>;
-  getEpochRaw(epochIndex: number): Promise<{
-    tallyIndex: number;
-    distributionIndex: number;
-    weightsTallied: number;
-    prescriptionsDone: number;
-    rewardsDistributed: number;
-    activeGatewayCount: number;
-    endTimestamp: number;
-  } | null>;
+  crankEpochStep(opts: {
+    batchSize?: number;
+    nameRegistryAccount?: Address | null;
+    enableClose?: boolean;
+    epochRetention?: number;
+  }): Promise<CrankEpochStepResult>;
 }
 
 export interface EpochSettings {
@@ -197,17 +206,17 @@ export class EpochStateMachine {
   }
 
   private async runCycle(): Promise<void> {
-    const { contract, log, batchSize, enableCloseEpochs } = this.config;
+    const { contract, log } = this.config;
 
-    // 1. Read epoch settings
+    // 1. Read epoch settings — the cheap source of truth for the `enabled`
+    // gate, `metrics.currentEpoch`, and the cleanup target. (crankEpochStep
+    // reads settings again internally to drive the lifecycle.)
     let settings: EpochSettings;
     try {
       settings = await this.config.getEpochSettings();
     } catch (err) {
-      // Route through error classifier — most failures here are transient
-      // RPC issues (fetch failed, blockhash not found) that should NOT count
-      // as real errors. handleError increments consecutiveRealErrors for
-      // genuine failures, which the health endpoint uses for readiness.
+      // Transient RPC issues (fetch failed, blockhash not found) classify as
+      // not_ready and must NOT count as real errors for the health endpoint.
       this.handleError(err, 'read_epoch_settings');
       return;
     }
@@ -219,190 +228,34 @@ export class EpochStateMachine {
     }
 
     const currentIndex = settings.currentEpochIndex;
-    // The most recently created epoch is currentIndex - 1
-    // (currentIndex is the NEXT epoch to be created)
+    // currentIndex is the NEXT epoch to create; the live one is currentIndex-1.
     const targetEpochIndex = currentIndex > 0 ? currentIndex - 1 : 0;
     this.metrics.currentEpoch = targetEpochIndex;
 
-    const now = Math.floor(Date.now() / 1000);
-    const nextEpochStart = settings.genesisTimestamp + currentIndex * settings.epochDuration;
-
-    // 2. Bootstrap: no epochs exist yet, create epoch 0 if genesis time has passed
-    if (currentIndex === 0) {
-      if (now >= nextEpochStart) {
-        this.metrics.phase = 'create_epoch';
-        log.info('Creating epoch', { epochIndex: 0 });
-        try {
-          const result = await contract.createEpoch();
-          log.info('Epoch created', { epochIndex: 0, tx: result.id });
-          this.metrics.epochsCreated++;
-          this.metrics.lastActionTime = new Date().toISOString();
-        } catch (err) {
-          this.handleError(err, 'create_epoch');
-        }
-      } else {
-        this.metrics.phase = 'waiting_for_genesis';
-        log.debug('Waiting for genesis', {
-          remainingSeconds: nextEpochStart - now,
-        });
-      }
-      return;
-    }
-
-    // 3. Read current epoch state
-    // IMPORTANT: Always complete the previous epoch's lifecycle
-    // (tally → prescribe → wait → distribute → close) BEFORE creating a new
-    // epoch. Otherwise rewards for the previous epoch never get distributed.
-    const epoch = await contract.getEpochRaw(targetEpochIndex);
-    if (!epoch) {
-      this.metrics.phase = 'waiting_for_epoch';
-      log.debug('No epoch account found', { epochIndex: targetEpochIndex });
-      return;
-    }
-
-    // 4. Tally weights
-    // Edge case: when activeGatewayCount === 0, tallyIndex is already >= active
-    // count so the contract will set weights_tallied=1 with no remaining_accounts.
-    // We must still submit ONE tx to trigger that flag flip, otherwise we loop.
-    if (epoch.weightsTallied === 0) {
-      this.metrics.phase = 'tally_weights';
-      this.metrics.tallyProgress = `${epoch.tallyIndex}/${epoch.activeGatewayCount}`;
-      log.info('Tallying weights', {
-        epochIndex: targetEpochIndex,
-        progress: `${epoch.tallyIndex}/${epoch.activeGatewayCount}`,
+    // 2. Advance the epoch lifecycle by ONE step. `crankEpochStep` (in
+    // @ar.io/sdk) owns create → tally → prescribe → distribute → close,
+    // including the size-safe prescribe prediction (≤50 Gateway PDAs, never the
+    // whole registry — the fix for MAX_TX_ACCOUNT_LOCKS) and the
+    // InvalidGatewayAccount re-predict-and-retry. We only map the result to
+    // metrics/logging and classify any thrown error.
+    let action: CrankEpochStepResult['action'] | undefined;
+    try {
+      const result = await contract.crankEpochStep({
+        batchSize: this.config.batchSize,
+        enableClose: this.config.enableCloseEpochs,
+        epochRetention: this.config.epochRetention ?? 7,
+        nameRegistryAccount: this.config.nameRegistryAccount,
       });
-      try {
-        const gatewayPDAs = epoch.activeGatewayCount > 0
-          ? await contract.getRegistryGatewayPDAs(epoch.tallyIndex, batchSize)
-          : [];
-        const result = await contract.tallyWeights({
-          epochIndex: targetEpochIndex,
-          gatewayAccounts: gatewayPDAs,
-        });
-        log.info('Tally batch submitted', { tx: result.id });
-        this.metrics.tallyBatches++;
-        this.metrics.lastActionTime = new Date().toISOString();
-      } catch (err) {
-        this.handleError(err, 'tally_weights');
-      }
-      return;
+      this.applyCrankResult(result);
+      action = result.action;
+    } catch (err) {
+      this.handleError(err, 'crank_epoch');
     }
 
-    // 5. Prescribe epoch
-    if (epoch.prescriptionsDone === 0) {
-      this.metrics.phase = 'prescribe_epoch';
-      log.info('Prescribing epoch', { epochIndex: targetEpochIndex });
-      try {
-        // Pass all active gateway PDAs — program selects the ones it needs
-        const allGatewayPDAs = await contract.getAllRegistryGatewayPDAs();
-        const result = await contract.prescribeEpoch({
-          epochIndex: targetEpochIndex,
-          gatewayAccounts: allGatewayPDAs,
-          nameRegistryAccount: this.config.nameRegistryAccount,
-        });
-        log.info('Epoch prescribed', { tx: result.id });
-        this.metrics.prescriptions++;
-        this.metrics.lastActionTime = new Date().toISOString();
-      } catch (err) {
-        this.handleError(err, 'prescribe_epoch');
-      }
-      return;
-    }
-
-    // 6. Wait for epoch to end (observations happen during the epoch)
-    if (now < epoch.endTimestamp) {
-      this.metrics.phase = 'waiting_for_observations';
-      const remaining = epoch.endTimestamp - now;
-      log.debug('Waiting for epoch to end', {
-        epochIndex: targetEpochIndex,
-        remainingSeconds: remaining,
-      });
-      return;
-    }
-
-    // 7. Distribute rewards
-    // Edge case: when activeGatewayCount === 0, call distributeEpoch with an
-    // empty remaining_accounts array so the contract sets rewards_distributed=1.
-    if (epoch.rewardsDistributed === 0) {
-      this.metrics.phase = 'distribute_epoch';
-      this.metrics.distributionProgress = `${epoch.distributionIndex}/${epoch.activeGatewayCount}`;
-      log.info('Distributing epoch', {
-        epochIndex: targetEpochIndex,
-        progress: `${epoch.distributionIndex}/${epoch.activeGatewayCount}`,
-      });
-      try {
-        const gatewayPDAs = epoch.activeGatewayCount > 0
-          ? await contract.getRegistryGatewayPDAs(epoch.distributionIndex, batchSize)
-          : [];
-        const result = await contract.distributeEpoch({
-          epochIndex: targetEpochIndex,
-          gatewayAccounts: gatewayPDAs,
-        });
-        log.info('Distribution batch submitted', { tx: result.id });
-        this.metrics.distributionBatches++;
-        this.metrics.lastActionTime = new Date().toISOString();
-      } catch (err) {
-        this.handleError(err, 'distribute_epoch');
-      }
-      return;
-    }
-
-    // 8. Close old epochs (optional) — GAR-006: close epochs older than retention
-    const retention = this.config.epochRetention ?? 7;
-    if (enableCloseEpochs && targetEpochIndex >= retention) {
-      const closeTarget = targetEpochIndex - retention;
-      this.metrics.phase = 'close_epoch';
-      try {
-        const oldEpoch = await contract.getEpochRaw(closeTarget);
-        if (oldEpoch && oldEpoch.rewardsDistributed === 1) {
-          log.info('Closing old epoch', { epochIndex: closeTarget });
-          const result = await contract.closeEpoch({ epochIndex: closeTarget });
-          log.info('Epoch closed', { epochIndex: closeTarget, tx: result.id });
-          this.metrics.epochsClosed++;
-          this.metrics.lastActionTime = new Date().toISOString();
-        }
-      } catch (err) {
-        // close_epoch has stricter preconditions than other steps (epoch must
-        // be fully distributed AND past retention). Errors here are expected
-        // during normal operation and are already counted via handleError's
-        // category metric — no extra logging needed.
-        this.handleError(err, 'close_epoch');
-      }
-    }
-
-    // 9. Current epoch is fully processed. If time has passed nextEpochStart,
-    // create the next epoch. This MUST come after the distribute check above,
-    // otherwise rewards for the current epoch would never be distributed
-    // (the cranker would create the next epoch first and lose track of the
-    // previous one).
-    if (now >= nextEpochStart) {
-      this.metrics.phase = 'create_epoch';
-      log.info('Creating epoch', { epochIndex: currentIndex });
-      try {
-        const result = await contract.createEpoch();
-        log.info('Epoch created', { epochIndex: currentIndex, tx: result.id });
-        this.metrics.epochsCreated++;
-        this.metrics.lastActionTime = new Date().toISOString();
-      } catch (err) {
-        const cat = this.handleError(err, 'create_epoch');
-        if (cat === 'already_done') {
-          log.debug('Epoch already created — will process on next tick');
-        }
-      }
-    }
-
-    // 10. Tick reached its quiescent tail. Fall through so the throttled
-    // cleanup block below has a chance to run on every tick that completes
-    // its main pipeline work. Mirrors observer's epoch-cranker.ts:280–292,
-    // which also does not early-return after create_epoch.
-    this.metrics.phase = 'idle';
-    log.debug('Epoch cycle complete', { epochIndex: targetEpochIndex });
-
-    // 11. Permissionless prune / cleanup (best-effort, throttled).
-    // Runs only after the pipeline reaches its quiescent tail; never blocks
-    // an epoch step. Errors here are isolated — handleError logs but the
-    // outer tick() exits cleanly.
-    if (this.config.enableCleanup !== false) {
+    // 3. Permissionless prune / cleanup (best-effort, throttled). Gated on the
+    // quiescent tail (`action === 'idle'`) so it never competes with a pending
+    // lifecycle step — same intent as the previous early-return structure.
+    if (action === 'idle' && this.config.enableCleanup !== false) {
       const minInterval = this.config.cleanupMinIntervalMs ?? 300_000;
       const elapsed = Date.now() - this.lastCleanupRunMs;
       if (elapsed >= minInterval) {
@@ -413,6 +266,60 @@ export class EpochStateMachine {
           this.handleError(err, 'cleanup');
         }
       }
+    }
+  }
+
+  /** Map a `crankEpochStep` result onto the cranker's metrics + logging. */
+  private applyCrankResult(r: CrankEpochStepResult): void {
+    const { log } = this.config;
+    const t = new Date().toISOString();
+    // A successful (non-throwing) step means we're making progress / not stuck.
+    this.metrics.consecutiveRealErrors = 0;
+    switch (r.action) {
+      case 'create':
+        this.metrics.phase = 'create_epoch';
+        this.metrics.epochsCreated++;
+        this.metrics.lastActionTime = t;
+        log.info('Epoch created', { epochIndex: r.epochIndex, tx: r.txId });
+        break;
+      case 'tally':
+        this.metrics.phase = 'tally_weights';
+        this.metrics.tallyBatches++;
+        if (r.progress)
+          this.metrics.tallyProgress = `${r.progress.index}/${r.progress.total}`;
+        this.metrics.lastActionTime = t;
+        log.info('Tally batch submitted', {
+          tx: r.txId,
+          progress: this.metrics.tallyProgress,
+        });
+        break;
+      case 'prescribe':
+        this.metrics.phase = 'prescribe_epoch';
+        this.metrics.prescriptions++;
+        this.metrics.lastActionTime = t;
+        log.info('Epoch prescribed', { epochIndex: r.epochIndex, tx: r.txId });
+        break;
+      case 'distribute':
+        this.metrics.phase = 'distribute_epoch';
+        this.metrics.distributionBatches++;
+        if (r.progress)
+          this.metrics.distributionProgress = `${r.progress.index}/${r.progress.total}`;
+        this.metrics.lastActionTime = t;
+        log.info('Distribution batch submitted', {
+          tx: r.txId,
+          progress: this.metrics.distributionProgress,
+        });
+        break;
+      case 'close':
+        this.metrics.phase = 'close_epoch';
+        this.metrics.epochsClosed++;
+        this.metrics.lastActionTime = t;
+        log.info('Epoch closed', { epochIndex: r.epochIndex, tx: r.txId });
+        break;
+      case 'idle':
+        this.metrics.phase = r.reason ?? 'idle';
+        log.debug('Idle', { reason: r.reason });
+        break;
     }
   }
 
