@@ -17,6 +17,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
+    "test": "tsx --test $(find src -name '*.test.ts')",
     "typecheck": "tsc --noEmit"
   },
   "engines": {
