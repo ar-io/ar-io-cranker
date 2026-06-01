@@ -38,6 +38,12 @@ export interface CrankerConfig {
   maxCleanupTxsPerCycle: number;
   /** Consecutive failed observations before a gateway is prune-eligible. Default 30. */
   cleanupFailureThreshold: number;
+  /**
+   * Recent signatures to scan when reclaiming leaked prescribe Address Lookup
+   * Tables (Phase 7). The ALT program can't be enumerated via getProgramAccounts,
+   * so discovery walks the signer's tx history. Default 200. Set 0 to disable.
+   */
+  altReclaimScanLimit: number;
 }
 
 function envOrDefault(key: string, defaultValue: string): string {
@@ -111,5 +117,6 @@ export function loadConfig(): CrankerConfig {
     cleanupBatchSize: parseIntEnv('CLEANUP_BATCH_SIZE', '15', 1, 100),
     maxCleanupTxsPerCycle: parseIntEnv('MAX_CLEANUP_TXS_PER_CYCLE', '50', 1, 500),
     cleanupFailureThreshold: parseIntEnv('CLEANUP_FAILURE_THRESHOLD', '30', 1),
+    altReclaimScanLimit: parseIntEnv('ALT_RECLAIM_SCAN_LIMIT', '200', 0, 1000),
   };
 }
