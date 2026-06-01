@@ -116,7 +116,11 @@ describe('EpochStateMachine.runCycle (crankEpochStep delegation)', () => {
     ] as const) {
       const { sm } = makeStateMachine({ action, epochIndex: 1, txId: 't' });
       await runCycle(sm);
-      assert.equal((sm.getMetrics() as Record<string, unknown>)[field], 1, action);
+      assert.equal(
+        (sm.getMetrics() as unknown as Record<string, unknown>)[field],
+        1,
+        action,
+      );
     }
   });
 
