@@ -45,6 +45,11 @@ const ALREADY_DONE_ERRORS = new Set<number>([
   6045,
   // PrescriptionsAlreadyDone (variant 49)
   6049,
+  // DelegationNotDisabled — the disabled-gateway delegate sweep (Phase 8)
+  // raced an operator re-enabling delegation between discovery and the claim
+  // landing; nothing left to crank for that gateway. Appended at the end of
+  // GarError (codes stay stable), so this is the current index.
+  6091,
 ]);
 
 const NOT_READY_ERRORS = new Set<number>([

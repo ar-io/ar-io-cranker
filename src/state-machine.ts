@@ -91,6 +91,8 @@ export interface StateMachineConfig {
   cleanupFailureThreshold?: number;
   /** Recent signatures to scan when reclaiming leaked prescribe ALTs (Phase 7). Default 200; 0 disables. */
   altReclaimScanLimit?: number;
+  /** Sweep delegates out of gateways with delegation disabled (Phase 8 — Fix #6). Default true. */
+  enableDisabledGatewaySweep?: boolean;
 }
 
 export interface StateMachineMetrics {
@@ -573,6 +575,49 @@ export class EpochStateMachine {
         }
       } catch (err) {
         this.handleError(err, 'cleanup_reclaim_lookup_tables');
+      }
+    }
+
+    // Phase 8: Disabled-gateway delegate sweep (WP §6.3 / Fix #6). When an
+    // operator turns off `allow_delegated_staking`, existing delegates are NOT
+    // auto-withdrawn (Solana can't iterate PDAs in one tx). This permissionless
+    // crank moves each stranded delegate into its own 30-day withdrawal vault,
+    // which also unblocks the operator's re-enable (gated on
+    // total_delegated_stake == 0 + cooldown). `claimDelegateFromDisabledGateway`
+    // is permissionless: the cranker pays rent; stake routes to the delegate.
+    if (budget.remaining > 0 && this.config.enableDisabledGatewaySweep !== false) {
+      try {
+        const disabled = await ario.getDisabledGatewaysWithDelegatedStake();
+        for (const gw of disabled) {
+          if (budget.remaining <= 0) break;
+          try {
+            // Enumerate this gateway's remaining delegates and crank each out.
+            const delegates = await ario.getGatewayDelegates({
+              address: gw.operator,
+              limit: budget.remaining,
+            });
+            for (const d of delegates.items) {
+              if (budget.remaining <= 0) break;
+              // Skip delegates already drained to 0 (e.g. self-claimed earlier);
+              // claiming them would fail the `delegation.amount > 0` constraint.
+              // They're swept off by the empty-delegation phase, not here.
+              if (Number(d.delegatedStake ?? 0) <= 0) continue;
+              try {
+                await ario.claimDelegateFromDisabledGateway({
+                  gatewayAddress: gw.operator,
+                  delegatorAddress: d.address,
+                });
+                budget.remaining--;
+              } catch (err) {
+                this.handleError(err, 'claim_delegate_from_disabled_gateway');
+              }
+            }
+          } catch (err) {
+            this.handleError(err, 'disabled_gateway_delegates_scan');
+          }
+        }
+      } catch (err) {
+        this.handleError(err, 'cleanup_disabled_gateways_scan');
       }
     }
 

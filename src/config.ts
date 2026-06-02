@@ -44,6 +44,13 @@ export interface CrankerConfig {
    * so discovery walks the signer's tx history. Default 200. Set 0 to disable.
    */
   altReclaimScanLimit: number;
+  /**
+   * Sweep delegates out of gateways whose operator DISABLED delegation
+   * (`allow_delegated_staking == false`) but that still hold delegated stake
+   * (Phase 8 — WP §6.3 / Fix #6). Without this crank, those delegates are
+   * stranded and the operator can never re-enable delegation. Default true.
+   */
+  enableDisabledGatewaySweep: boolean;
 }
 
 function envOrDefault(key: string, defaultValue: string): string {
@@ -118,5 +125,7 @@ export function loadConfig(): CrankerConfig {
     maxCleanupTxsPerCycle: parseIntEnv('MAX_CLEANUP_TXS_PER_CYCLE', '50', 1, 500),
     cleanupFailureThreshold: parseIntEnv('CLEANUP_FAILURE_THRESHOLD', '30', 1),
     altReclaimScanLimit: parseIntEnv('ALT_RECLAIM_SCAN_LIMIT', '200', 0, 1000),
+    enableDisabledGatewaySweep:
+      envOrDefault('ENABLE_DISABLED_GATEWAY_SWEEP', 'true') === 'true',
   };
 }
