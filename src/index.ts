@@ -292,6 +292,7 @@ async function main() {
     maxCleanupTxsPerCycle: config.maxCleanupTxsPerCycle,
     cleanupFailureThreshold: config.cleanupFailureThreshold,
     altReclaimScanLimit: config.altReclaimScanLimit,
+    enableDisabledGatewaySweep: config.enableDisabledGatewaySweep,
   });
 
   // Start health server — mark unhealthy if tick hasn't run in 3x the poll interval
