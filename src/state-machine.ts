@@ -152,6 +152,12 @@ export class EpochStateMachine {
   // sub-pipeline to at most once per `cleanupMinIntervalMs`.
   private lastCleanupRunMs = 0;
 
+  // Lowest epoch index that actually exists on-chain (AO→Solana continuity
+  // floor). Cached so the Phase-4 observation cleanup never fans out
+  // `closeObservation` to pre-continuity epochs that never existed (the 3007
+  // RPC-noise floor). Null until first probed.
+  private firstExistingEpochIndex: number | null = null;
+
   constructor(config: StateMachineConfig) {
     this.config = config;
   }
@@ -461,23 +467,47 @@ export class EpochStateMachine {
     // registry won't be found; `closeObservation` no-ops on missing PDAs
     // (Anchor returns AccountNotInitialized / AccountOwnedByWrongProgram,
     // both classified as `already_done`).
+    //
+    // CONTINUITY FLOOR (mirror of ar-io-observer/src/epoch/epoch-cranker.ts):
+    // at AO→Solana cutover the network jumped `current_epoch_index` straight to
+    // the AO value (~454) with NO prior epochs on-chain, so every epoch below
+    // the first-created index never existed. Fanning `closeObservation` out to
+    // those is N guaranteed 3007 misses PER CYCLE (wasted RPC simulations →
+    // 429s) that classify as `already_done` and silently burn the budget. Skip
+    // below the known floor with zero RPC; otherwise probe the epoch's
+    // existence ONCE and skip the whole observer fan-out if it never existed.
     const retention = this.config.epochRetention ?? 7;
     if (budget.remaining > 0 && currentEpochIndex >= retention + 1) {
       try {
-        const observerAddrs = await ario.getRegistryGatewayAddresses?.();
         const closeTarget = currentEpochIndex - retention - 1;
-        if (Array.isArray(observerAddrs)) {
-          for (const observer of observerAddrs) {
-            if (budget.remaining <= 0) break;
-            try {
-              await ario.closeObservation({
-                epochIndex: closeTarget,
-                observer,
-              });
-              budget.remaining--;
-            } catch (err) {
-              const cat = this.handleError(err, 'close_observation');
-              if (cat === 'real') break;
+        if (
+          this.firstExistingEpochIndex !== null &&
+          closeTarget < this.firstExistingEpochIndex
+        ) {
+          // Below the continuity floor — nothing to close, zero RPC.
+        } else {
+          const targetEpoch = await ario.getEpochRaw?.(closeTarget);
+          if (!targetEpoch) {
+            // Never existed (pre-continuity gap) — raise the floor estimate and
+            // skip the per-observer fan-out entirely.
+            this.firstExistingEpochIndex = closeTarget + 1;
+          } else {
+            this.firstExistingEpochIndex = closeTarget; // pin the real floor
+            const observerAddrs = await ario.getRegistryGatewayAddresses?.();
+            if (Array.isArray(observerAddrs)) {
+              for (const observer of observerAddrs) {
+                if (budget.remaining <= 0) break;
+                try {
+                  await ario.closeObservation({
+                    epochIndex: closeTarget,
+                    observer,
+                  });
+                  budget.remaining--;
+                } catch (err) {
+                  const cat = this.handleError(err, 'close_observation');
+                  if (cat === 'real') break;
+                }
+              }
             }
           }
         }
