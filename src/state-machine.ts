@@ -20,7 +20,15 @@ const LAMPORTS_PER_SOL = 1_000_000_000;
 // build artifacts. The actual object passed in must have these methods.
 /** Result of one `SolanaARIOWriteable.crankEpochStep()` call (mirrors @ar.io/sdk). */
 export interface CrankEpochStepResult {
-  action: 'create' | 'tally' | 'prescribe' | 'distribute' | 'close' | 'idle';
+  action:
+    | 'create'
+    | 'tally'
+    | 'prescribe'
+    | 'distribute'
+    | 'compound'
+    | 'update_demand_factor'
+    | 'close'
+    | 'idle';
   epochIndex?: number;
   txId?: string;
   progress?: { index: number; total: number };
@@ -109,6 +117,8 @@ export interface StateMachineMetrics {
   prescriptions: number;
   distributionBatches: number;
   epochsClosed: number;
+  compoundBatches: number;
+  demandFactorRolls: number;
   errorsAlreadyDone: number;
   errorsNotReady: number;
   errorsReal: number;
@@ -139,6 +149,8 @@ export class EpochStateMachine {
     prescriptions: 0,
     distributionBatches: 0,
     epochsClosed: 0,
+    compoundBatches: 0,
+    demandFactorRolls: 0,
     errorsAlreadyDone: 0,
     errorsNotReady: 0,
     errorsReal: 0,
@@ -325,6 +337,23 @@ export class EpochStateMachine {
         this.metrics.epochsClosed++;
         this.metrics.lastActionTime = t;
         log.info('Epoch closed', { epochIndex: r.epochIndex, tx: r.txId });
+        break;
+      case 'compound':
+        this.metrics.phase = 'compound_rewards';
+        this.metrics.compoundBatches++;
+        this.metrics.lastActionTime = t;
+        log.info('Delegate rewards compounded', {
+          tx: r.txId,
+          progress: r.progress
+            ? `${r.progress.index}/${r.progress.total}`
+            : undefined,
+        });
+        break;
+      case 'update_demand_factor':
+        this.metrics.phase = 'update_demand_factor';
+        this.metrics.demandFactorRolls++;
+        this.metrics.lastActionTime = t;
+        log.info('Demand factor rolled', { tx: r.txId });
         break;
       case 'idle':
         this.metrics.phase = r.reason ?? 'idle';

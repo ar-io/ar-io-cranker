@@ -23,6 +23,8 @@ export interface CrankerMetrics {
   prescriptions: number;
   distributionBatches: number;
   epochsClosed: number;
+  compoundBatches: number;
+  demandFactorRolls: number;
   errorsAlreadyDone: number;
   errorsNotReady: number;
   errorsReal: number;
@@ -119,6 +121,12 @@ export function startHealthServer(cfg: HealthServerConfig): http.Server {
         `# HELP cranker_epochs_closed_total Total epochs closed`,
         `# TYPE cranker_epochs_closed_total counter`,
         `cranker_epochs_closed_total ${m.epochsClosed}`,
+        `# HELP cranker_compound_batches_total Total compound_delegation_rewards batches submitted`,
+        `# TYPE cranker_compound_batches_total counter`,
+        `cranker_compound_batches_total ${m.compoundBatches}`,
+        `# HELP cranker_demand_factor_rolls_total Total update_demand_factor rolls submitted`,
+        `# TYPE cranker_demand_factor_rolls_total counter`,
+        `cranker_demand_factor_rolls_total ${m.demandFactorRolls}`,
         `# HELP cranker_errors_total Errors by category`,
         `# TYPE cranker_errors_total counter`,
         `cranker_errors_total{type="already_done"} ${m.errorsAlreadyDone}`,
