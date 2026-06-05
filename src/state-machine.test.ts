@@ -68,12 +68,12 @@ describe('EpochStateMachine.runCycle (crankEpochStep delegation)', () => {
     const { sm, crankCalls } = makeStateMachine({ action: 'idle', reason: 'epoch_complete' });
     await runCycle(sm);
     assert.equal(crankCalls.length, 1);
-    assert.deepEqual(crankCalls[0], {
-      batchSize: 25,
-      enableClose: true,
-      epochRetention: 9,
-      nameRegistryAccount: 'nameReg',
-    });
+    // Assert the lifecycle opts individually so added opts (e.g. the returned-
+    // name prune knobs) don't make this brittle.
+    assert.equal(crankCalls[0].batchSize, 25);
+    assert.equal(crankCalls[0].enableClose, true);
+    assert.equal(crankCalls[0].epochRetention, 9);
+    assert.equal(crankCalls[0].nameRegistryAccount, 'nameReg');
   });
 
   it('does not call crankEpochStep when epochs are disabled', async () => {

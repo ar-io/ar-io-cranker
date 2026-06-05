@@ -27,6 +27,7 @@ export interface CrankEpochStepResult {
     | 'distribute'
     | 'compound'
     | 'update_demand_factor'
+    | 'prune_returned_names'
     | 'close'
     | 'idle';
   epochIndex?: number;
@@ -51,6 +52,9 @@ export interface EpochCrankerContract {
     nameRegistryAccount?: Address | null;
     enableClose?: boolean;
     epochRetention?: number;
+    enablePrune?: boolean;
+    pruneBatchSize?: number;
+    pruneScanIntervalMs?: number;
   }): Promise<CrankEpochStepResult>;
 }
 
@@ -119,6 +123,7 @@ export interface StateMachineMetrics {
   epochsClosed: number;
   compoundBatches: number;
   demandFactorRolls: number;
+  returnedNamesPruneBatches: number;
   errorsAlreadyDone: number;
   errorsNotReady: number;
   errorsReal: number;
@@ -151,6 +156,7 @@ export class EpochStateMachine {
     epochsClosed: 0,
     compoundBatches: 0,
     demandFactorRolls: 0,
+    returnedNamesPruneBatches: 0,
     errorsAlreadyDone: 0,
     errorsNotReady: 0,
     errorsReal: 0,
@@ -267,6 +273,11 @@ export class EpochStateMachine {
         enableClose: this.config.enableCloseEpochs,
         epochRetention: this.config.epochRetention ?? 7,
         nameRegistryAccount: this.config.nameRegistryAccount,
+        // Returned-name pruning is folded into the epoch step (solana.36+):
+        // tie it to the same cleanup config the runCleanup phases use.
+        enablePrune: this.config.enableCleanup !== false,
+        pruneBatchSize: this.config.cleanupBatchSize,
+        pruneScanIntervalMs: this.config.cleanupMinIntervalMs,
       });
       this.applyCrankResult(result);
       action = result.action;
@@ -355,6 +366,17 @@ export class EpochStateMachine {
         this.metrics.lastActionTime = t;
         log.info('Demand factor rolled', { tx: r.txId });
         break;
+      case 'prune_returned_names':
+        this.metrics.phase = 'prune_returned_names';
+        this.metrics.returnedNamesPruneBatches++;
+        this.metrics.lastActionTime = t;
+        log.info('Pruned expired returned names', {
+          tx: r.txId,
+          progress: r.progress
+            ? `${r.progress.index}/${r.progress.total}`
+            : undefined,
+        });
+        break;
       case 'idle':
         this.metrics.phase = r.reason ?? 'idle';
         log.debug('Idle', { reason: r.reason });
@@ -421,34 +443,11 @@ export class EpochStateMachine {
       }
     }
 
-    // Phase 2: ArNS expired returned names — gated on `next_returned_names_prune_timestamp`.
-    if (budget.remaining > 0) {
-      try {
-        const cfg = await ario.getArnsConfigRaw();
-        if (cfg && Number(cfg.nextReturnedNamesPruneTimestamp) <= now) {
-          const expired = await ario.getExpiredReturnedNames(now);
-          while (expired.length > 0 && budget.remaining > 0) {
-            const batch = expired
-              .splice(0, batchSize)
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              .map((r: any) => r.pubkey);
-            try {
-              await ario.pruneReturnedNames({
-                maxNames: batch.length,
-                returnedNames: batch,
-              });
-              budget.remaining--;
-              log.info('Pruned expired ReturnedNames', { count: batch.length });
-            } catch (err) {
-              this.handleError(err, 'prune_returned_names');
-              break;
-            }
-          }
-        }
-      } catch (err) {
-        this.handleError(err, 'cleanup_returned_names_scan');
-      }
-    }
+    // Phase 2: ArNS expired returned names — now owned by `crankEpochStep`
+    // (@ar.io/sdk >= solana.36). It scans the ReturnedName PDAs directly in the
+    // epoch step's idle exits, WITHOUT the stale `next_returned_names_prune_timestamp`
+    // gate that stranded imported returned names. Removed here so there's a
+    // single source of truth — see the crankEpochStep call in runCycle.
 
     // Phase 3: Deficient gateways → prune_gateway, plus Gone gateways → finalize_gone.
     if (budget.remaining > 0) {
