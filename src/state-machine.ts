@@ -28,6 +28,7 @@ export interface CrankEpochStepResult {
     | 'compound'
     | 'update_demand_factor'
     | 'prune_returned_names'
+    | 'close_observation'
     | 'close'
     | 'idle';
   epochIndex?: number;
@@ -124,6 +125,7 @@ export interface StateMachineMetrics {
   compoundBatches: number;
   demandFactorRolls: number;
   returnedNamesPruneBatches: number;
+  observationCloseBatches: number;
   errorsAlreadyDone: number;
   errorsNotReady: number;
   errorsReal: number;
@@ -157,6 +159,7 @@ export class EpochStateMachine {
     compoundBatches: 0,
     demandFactorRolls: 0,
     returnedNamesPruneBatches: 0,
+    observationCloseBatches: 0,
     errorsAlreadyDone: 0,
     errorsNotReady: 0,
     errorsReal: 0,
@@ -371,6 +374,18 @@ export class EpochStateMachine {
         this.metrics.returnedNamesPruneBatches++;
         this.metrics.lastActionTime = t;
         log.info('Pruned expired returned names', {
+          tx: r.txId,
+          progress: r.progress
+            ? `${r.progress.index}/${r.progress.total}`
+            : undefined,
+        });
+        break;
+      case 'close_observation':
+        this.metrics.phase = 'close_observation';
+        this.metrics.observationCloseBatches++;
+        this.metrics.lastActionTime = t;
+        log.info('Closed epoch observations (pre close_epoch)', {
+          epochIndex: r.epochIndex,
           tx: r.txId,
           progress: r.progress
             ? `${r.progress.index}/${r.progress.total}`

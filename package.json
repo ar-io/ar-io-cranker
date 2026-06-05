@@ -31,7 +31,7 @@
     "registry": "https://npm.pkg.github.com"
   },
   "dependencies": {
-    "@ar.io/sdk": "^4.0.0-solana.37",
+    "@ar.io/sdk": "^4.0.0-solana.39",
     "@solana/kit": "^6.8.0"
   },
   "devDependencies": {
