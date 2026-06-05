@@ -26,6 +26,7 @@ export interface CrankerMetrics {
   compoundBatches: number;
   demandFactorRolls: number;
   returnedNamesPruneBatches: number;
+  observationCloseBatches: number;
   errorsAlreadyDone: number;
   errorsNotReady: number;
   errorsReal: number;
@@ -131,6 +132,9 @@ export function startHealthServer(cfg: HealthServerConfig): http.Server {
         `# HELP cranker_returned_names_prune_batches_total Total prune_returned_names batches submitted`,
         `# TYPE cranker_returned_names_prune_batches_total counter`,
         `cranker_returned_names_prune_batches_total ${m.returnedNamesPruneBatches}`,
+        `# HELP cranker_observation_close_batches_total Total close_observation batches submitted (before close_epoch)`,
+        `# TYPE cranker_observation_close_batches_total counter`,
+        `cranker_observation_close_batches_total ${m.observationCloseBatches}`,
         `# HELP cranker_errors_total Errors by category`,
         `# TYPE cranker_errors_total counter`,
         `cranker_errors_total{type="already_done"} ${m.errorsAlreadyDone}`,
