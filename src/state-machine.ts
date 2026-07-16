@@ -505,11 +505,16 @@ export class EpochStateMachine {
 
     // Phase 4: Close old observations from epochs older than
     // `currentEpochIndex - retention`. The Observation PDA seed is
-    // `(epochIndex, observer)`. We need the observer addresses — easiest
-    // source is the active GatewayRegistry. Observers not in the current
-    // registry won't be found; `closeObservation` no-ops on missing PDAs
-    // (Anchor returns AccountNotInitialized / AccountOwnedByWrongProgram,
-    // both classified as `already_done`).
+    // `(epochIndex, observer)`, where `observer` is the gateway's
+    // operator-supplied `observer_address` — a DISTINCT field from the
+    // operator address the GatewayRegistry enumerates. So we must enumerate
+    // by `getEpochObservers(closeTarget)`, which reads the actual Observation
+    // PDAs for that epoch and returns their real `observation.observer`
+    // addresses; closing by the registry's operator address would target
+    // non-existent PDAs for any gateway whose `observer_address != operator`,
+    // leaking the rent AND leaving `close_epoch`'s
+    // `observations_closed == observations_submitted` gate unsatisfiable.
+    // Empty list (no observations that epoch) ⇒ nothing to do.
     //
     // CONTINUITY FLOOR (mirror of ar-io-observer/src/epoch/epoch-cranker.ts):
     // at AO→Solana cutover the network jumped `current_epoch_index` straight to
@@ -536,7 +541,10 @@ export class EpochStateMachine {
             this.firstExistingEpochIndex = closeTarget + 1;
           } else {
             this.firstExistingEpochIndex = closeTarget; // pin the real floor
-            const observerAddrs = await ario.getRegistryGatewayAddresses?.();
+            // Enumerate the epoch's real Observation PDAs by their
+            // `observation.observer` address (NOT the registry operator
+            // address). closeObservation routes the rent refund to `observer`.
+            const observerAddrs = await ario.getEpochObservers?.(closeTarget);
             if (Array.isArray(observerAddrs)) {
               for (const observer of observerAddrs) {
                 if (budget.remaining <= 0) break;

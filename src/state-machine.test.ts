@@ -283,3 +283,151 @@ describe('EpochStateMachine cleanup — disabled-gateway delegate sweep (Phase 8
     ]);
   });
 });
+
+// ---------------------------------------------------------------
+// Phase 4: close old observations (enumerate by observation.observer)
+// ---------------------------------------------------------------
+
+interface ObservationCounters {
+  getEpochRawCalls: number[];
+  getEpochObserversCalls: number[];
+  getRegistryGatewayAddressesCalls: number;
+  closeObservationCalls: Array<{ epochIndex: number; observer: string }>;
+}
+
+/**
+ * Build a state machine whose contract no-ops every cleanup phase except
+ * Phase 4 (close_observation). Phase 4 must enumerate close targets via
+ * `getEpochObservers(epochIndex)` — the real `observation.observer` addresses
+ * for that epoch — NOT the gateway registry's operator addresses (the two
+ * differ whenever a gateway sets `observer_address != operator`).
+ * `operatorAddrs` is wired to `getRegistryGatewayAddresses` only to prove the
+ * close loop never consults it.
+ */
+function makeObservationSM(opts: {
+  existingEpochs: Set<number>;
+  epochObservers: string[];
+  operatorAddrs?: string[];
+  epochRetention?: number;
+}): { sm: EpochStateMachine; counters: ObservationCounters } {
+  const counters: ObservationCounters = {
+    getEpochRawCalls: [],
+    getEpochObserversCalls: [],
+    getRegistryGatewayAddressesCalls: 0,
+    closeObservationCalls: [],
+  };
+  const overrides: Record<string, (...a: unknown[]) => unknown> = {
+    crankEpochStep: async () => ({ action: 'idle', reason: 'epoch_complete' }),
+    getArnsConfigRaw: async () => null,
+    getEpochRaw: async (epochIndex: unknown) => {
+      const idx = epochIndex as number;
+      counters.getEpochRawCalls.push(idx);
+      return opts.existingEpochs.has(idx) ? { rewardsDistributed: 1 } : null;
+    },
+    // Real Observation-PDA enumeration keyed by `observation.observer`.
+    getEpochObservers: async (epochIndex: unknown) => {
+      const idx = epochIndex as number;
+      counters.getEpochObserversCalls.push(idx);
+      return opts.existingEpochs.has(idx) ? opts.epochObservers : [];
+    },
+    // Wired but must NOT be used for close targets (operator != observer).
+    getRegistryGatewayAddresses: async () => {
+      counters.getRegistryGatewayAddressesCalls++;
+      return opts.operatorAddrs ?? [];
+    },
+    closeObservation: async (params: unknown) => {
+      const p = params as { epochIndex: number; observer: string };
+      counters.closeObservationCalls.push({
+        epochIndex: p.epochIndex,
+        observer: p.observer,
+      });
+      return { id: 'sig' };
+    },
+  };
+  const contract = new Proxy(
+    {},
+    {
+      get(_t, prop: string) {
+        return prop in overrides ? overrides[prop] : async () => [];
+      },
+    },
+  ) as unknown as EpochCrankerContract;
+
+  const config: StateMachineConfig = {
+    contract,
+    rpc: {} as never,
+    signer: { address: 'signer' } as never,
+    pollIntervalMs: 1000,
+    batchSize: 25,
+    enableCloseEpochs: true,
+    epochRetention: opts.epochRetention ?? 7,
+    enableCleanup: true,
+    cleanupMinIntervalMs: 0,
+    log: noopLog,
+    getEpochSettings: async () => enabledSettings,
+    nameRegistryAccount: 'nameReg' as never,
+  };
+  return { sm: new EpochStateMachine(config), counters };
+}
+
+// runCleanup is private; drive it directly with an explicit epoch index.
+// biome-ignore lint/suspicious/noExplicitAny: test reaches a private method
+const runCleanup = (sm: EpochStateMachine, currentEpochIndex: number) =>
+  (sm as any).runCleanup(currentEpochIndex);
+
+describe('EpochStateMachine cleanup — close observations (Phase 4)', () => {
+  it('closes exactly the epoch observer PDAs (not the registry operator addresses) once the target epoch exists', async () => {
+    // Healthy steady state: closeTarget = 470 - 7 - 1 = 462 exists on-chain.
+    // The epoch's real observer addresses are DISTINCT from the registry
+    // operator addresses — the close loop must target the former.
+    const { sm, counters } = makeObservationSM({
+      existingEpochs: new Set([462]),
+      epochObservers: ['obsA', 'obsB', 'obsC'],
+      operatorAddrs: ['operator1', 'operator2', 'operator3'],
+    });
+
+    await runCleanup(sm, 470);
+
+    assert.deepEqual(counters.getEpochRawCalls, [462]);
+    // Enumerated the actual Observation PDAs for the existing close target...
+    assert.deepEqual(counters.getEpochObserversCalls, [462]);
+    // ...and closed one per observer, keyed by observation.observer.
+    assert.deepEqual(counters.closeObservationCalls, [
+      { epochIndex: 462, observer: 'obsA' },
+      { epochIndex: 462, observer: 'obsB' },
+      { epochIndex: 462, observer: 'obsC' },
+    ]);
+    // The close loop must NOT key off the operator/registry address.
+    assert.equal(counters.getRegistryGatewayAddressesCalls, 0);
+  });
+
+  it('does NOT enumerate or close when the target epoch never existed (continuity gap)', async () => {
+    // Continuity cutover: currentEpochIndex 454, closeTarget 446 never existed.
+    const { sm, counters } = makeObservationSM({
+      existingEpochs: new Set(),
+      epochObservers: ['obsA', 'obsB'],
+    });
+
+    await runCleanup(sm, 454);
+
+    assert.deepEqual(counters.getEpochRawCalls, [446]);
+    // Never enumerate observers (or close) for an epoch that never existed.
+    assert.equal(counters.getEpochObserversCalls.length, 0);
+    assert.equal(counters.closeObservationCalls.length, 0);
+  });
+
+  it('does nothing (no error) when the existing epoch has no observations', async () => {
+    // closeTarget exists but nobody observed it — getEpochObservers returns [].
+    const { sm, counters } = makeObservationSM({
+      existingEpochs: new Set([462]),
+      epochObservers: [],
+      operatorAddrs: ['operator1', 'operator2'],
+    });
+
+    await runCleanup(sm, 470);
+
+    assert.deepEqual(counters.getEpochObserversCalls, [462]);
+    assert.equal(counters.closeObservationCalls.length, 0);
+    assert.equal(counters.getRegistryGatewayAddressesCalls, 0);
+  });
+});
