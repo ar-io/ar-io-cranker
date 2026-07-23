@@ -283,3 +283,119 @@ describe('EpochStateMachine cleanup — disabled-gateway delegate sweep (Phase 8
     ]);
   });
 });
+
+// ---------------------------------------------------------------
+// Phase 4: observation close — enumerate the epoch's real observers,
+// NEVER brute-force the GatewayRegistry (firehose fix; parity with
+// ar-io-observer PR #105).
+// ---------------------------------------------------------------
+
+/**
+ * Build a state machine that reaches the Phase-4 observation-close pass.
+ * `currentEpochIndex` is high enough (default 20, retention 9) that
+ * `closeTarget` (currentIndex-1-retention-1 = 9) lands on an EXISTING epoch
+ * (getEpochRaw truthy). `getEpochObservers` returns the epoch's real
+ * submitters; `getRegistryGatewayAddresses` is counted so we can assert the
+ * old whole-registry fan-out (the firehose) is never taken.
+ */
+function makeObsCleanupSM(opts: {
+  epochObservers: string[];
+  currentEpochIndex?: number;
+  epochRetention?: number;
+}): {
+  sm: EpochStateMachine;
+  closeCalls: Array<{ epochIndex: number; observer: string }>;
+  getEpochObserversCalls: number[];
+  registryCalls: { n: number };
+} {
+  const currentEpochIndex = opts.currentEpochIndex ?? 20;
+  const epochRetention = opts.epochRetention ?? 9;
+  const closeCalls: Array<{ epochIndex: number; observer: string }> = [];
+  const getEpochObserversCalls: number[] = [];
+  const registryCalls = { n: 0 };
+
+  const overrides: Record<string, (...a: unknown[]) => unknown> = {
+    crankEpochStep: async () => ({ action: 'idle', reason: 'epoch_complete' }),
+    getArnsConfigRaw: async () => null,
+    // closeTarget epoch exists → proceed to the observer enumeration.
+    getEpochRaw: async () => ({ exists: true }),
+    getEpochObservers: async (epochIndex: unknown) => {
+      getEpochObserversCalls.push(epochIndex as number);
+      return opts.epochObservers;
+    },
+    // The old firehose source — Phase 4 must NEVER call this anymore.
+    getRegistryGatewayAddresses: async () => {
+      registryCalls.n++;
+      return opts.epochObservers;
+    },
+    closeObservation: async (p: unknown) => {
+      closeCalls.push(p as { epochIndex: number; observer: string });
+      return { id: 'tx' };
+    },
+  };
+  const contract = new Proxy(
+    {},
+    {
+      get(_t, prop: string) {
+        return prop in overrides ? overrides[prop] : async () => [];
+      },
+    },
+  ) as unknown as EpochCrankerContract;
+
+  const config: StateMachineConfig = {
+    contract,
+    rpc: {} as never,
+    signer: { address: 'signer' } as never,
+    pollIntervalMs: 1000,
+    batchSize: 25,
+    enableCloseEpochs: true,
+    epochRetention,
+    enableCleanup: true,
+    cleanupMinIntervalMs: 0,
+    maxCleanupTxsPerCycle: 50,
+    log: noopLog,
+    getEpochSettings: async () => ({
+      currentEpochIndex,
+      genesisTimestamp: 0,
+      epochDuration: 100,
+      enabled: true,
+    }),
+    nameRegistryAccount: 'nameReg' as never,
+  };
+  return {
+    sm: new EpochStateMachine(config),
+    closeCalls,
+    getEpochObserversCalls,
+    registryCalls,
+  };
+}
+
+describe('EpochStateMachine cleanup — Phase 4 observation close (firehose fix)', () => {
+  it('closes ONLY the epoch observers and NEVER walks the gateway registry', async () => {
+    // currentEpochIndex 20, retention 9 → targetEpochIndex 19 → closeTarget 9.
+    const { sm, closeCalls, getEpochObserversCalls, registryCalls } =
+      makeObsCleanupSM({ epochObservers: ['obsA', 'obsB'] });
+    await runCycle(sm);
+
+    assert.deepEqual(closeCalls, [
+      { epochIndex: 9, observer: 'obsA' },
+      { epochIndex: 9, observer: 'obsB' },
+    ]);
+    assert.deepEqual(getEpochObserversCalls, [9]);
+    assert.equal(
+      registryCalls.n,
+      0,
+      'must never brute-force the whole registry (the firehose)',
+    );
+  });
+
+  it('fires ZERO close_observation when the epoch has no live observers (the 643→0 case)', async () => {
+    const { sm, closeCalls, getEpochObserversCalls, registryCalls } =
+      makeObsCleanupSM({ epochObservers: [] });
+    await runCycle(sm);
+
+    assert.equal(closeCalls.length, 0);
+    assert.deepEqual(getEpochObserversCalls, [9]);
+    assert.equal(registryCalls.n, 0);
+  });
+});

@@ -505,11 +505,13 @@ export class EpochStateMachine {
 
     // Phase 4: Close old observations from epochs older than
     // `currentEpochIndex - retention`. The Observation PDA seed is
-    // `(epochIndex, observer)`. We need the observer addresses — easiest
-    // source is the active GatewayRegistry. Observers not in the current
-    // registry won't be found; `closeObservation` no-ops on missing PDAs
-    // (Anchor returns AccountNotInitialized / AccountOwnedByWrongProgram,
-    // both classified as `already_done`).
+    // `(epochIndex, observer)`. We close exactly the observers that actually
+    // submitted — `getEpochObservers(closeTarget)` enumerates the real
+    // Observation PDAs for the epoch (one getProgramAccounts scan, ~tens),
+    // NOT the whole GatewayRegistry (~643). `closeObservation` still no-ops on
+    // any missing PDA (Anchor AccountNotInitialized / AccountOwnedByWrongProgram,
+    // both classified as `already_done`), but we no longer manufacture ~635
+    // guaranteed misses per cycle.
     //
     // CONTINUITY FLOOR (mirror of ar-io-observer/src/epoch/epoch-cranker.ts):
     // at AO→Solana cutover the network jumped `current_epoch_index` straight to
@@ -536,7 +538,16 @@ export class EpochStateMachine {
             this.firstExistingEpochIndex = closeTarget + 1;
           } else {
             this.firstExistingEpochIndex = closeTarget; // pin the real floor
-            const observerAddrs = await ario.getRegistryGatewayAddresses?.();
+            // Enumerate the epoch's ACTUAL observers (live Observation PDAs for
+            // `closeTarget`, ~tens) instead of brute-forcing the whole registry
+            // (~643). The old `getRegistryGatewayAddresses()` fan-out fired
+            // `close_observation` at every gateway and relied on the ~98% with
+            // no PDA to no-op (3012/3007). Because `budget.remaining` only
+            // decrements on SUCCESS, those guaranteed-failing tx-simulations
+            // never throttled the loop — hundreds of failures/cycle that drove
+            // the RPC into 429s (the close_observation firehose). Mirrors
+            // ar-io-observer PR #105.
+            const observerAddrs = await ario.getEpochObservers?.(closeTarget);
             if (Array.isArray(observerAddrs)) {
               for (const observer of observerAddrs) {
                 if (budget.remaining <= 0) break;
