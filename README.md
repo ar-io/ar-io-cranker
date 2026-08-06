@@ -60,7 +60,8 @@ All settings are environment variables.
 |---|---|---|
 | **`SOLANA_RPC_URL`** | *(required)* | Solana JSON-RPC endpoint |
 | **`SOLANA_KEYPAIR_PATH`** | *(required)* | Path to signer keypair JSON |
-| `POLL_INTERVAL_MS` | `10000` | Tick interval (min 1000) |
+| `POLL_INTERVAL_MS` | *derived* | Tick interval ms (min 1000). Optional — **derived from the epoch duration when unset** (~60s on 24h epochs, down to 10s on short ones); an explicit value overrides. |
+| `CLEANUP_MIN_INTERVAL_MS` | *derived* | Min ms between cleanup passes (min 30000). Optional — derived from the epoch duration when unset (~30min on 24h, 5min on short); an explicit value overrides. |
 | `BATCH_SIZE` | `15` | Tally/distribute batch size |
 | `ENABLE_CLOSE_EPOCHS` | `true` | Close old epochs |
 | `EPOCH_RETENTION` | `7` | Epochs to keep before closing |

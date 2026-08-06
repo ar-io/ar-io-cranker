@@ -4,7 +4,8 @@
 export interface CrankerConfig {
   solanaRpcUrl: string;
   solanaKeypairPath: string;
-  pollIntervalMs: number;
+  /** Optional: when unset, derived from epoch duration (see adaptive-intervals.ts). */
+  pollIntervalMs?: number;
   batchSize: number;
   enableCloseEpochs: boolean;
   /** Number of epochs behind current to close. Default 7. */
@@ -30,8 +31,9 @@ export interface CrankerConfig {
   // --- Permissionless cleanup loop (see state-machine.ts:runCleanup) ---
   /** Master toggle for the cleanup pass. Default true. */
   enableCleanup: boolean;
-  /** Minimum interval between cleanup passes (ms). Default 300000 = 5 min. */
-  cleanupMinIntervalMs: number;
+  /** Minimum interval between cleanup passes (ms). Optional: derived from epoch
+   * duration when unset (see adaptive-intervals.ts). */
+  cleanupMinIntervalMs?: number;
   /** Batch size for ArNS-record / returned-name pruning. Default 15. */
   cleanupBatchSize: number;
   /** Per-cycle tx cap across all cleanup sub-phases. Default 50. */
@@ -81,6 +83,32 @@ function parseIntEnv(key: string, defaultValue: string, min?: number, max?: numb
   return val;
 }
 
+// Like parseIntEnv, but returns undefined when the env var is unset so callers
+// can distinguish "operator set an explicit value" from "not set" and fall back
+// to a derived/adaptive default. Still validates when a value IS set. Uses
+// Number() (not parseInt) so partial typos like "15ms" fail loudly.
+function parseIntEnvOrUndefined(
+  key: string,
+  min?: number,
+  max?: number,
+): number | undefined {
+  const raw = process.env[key];
+  if (raw === undefined || raw.trim() === '') {
+    return undefined;
+  }
+  const val = Number(raw);
+  if (!Number.isSafeInteger(val)) {
+    throw new Error(`Invalid ${key}: must be an integer, got "${raw}"`);
+  }
+  if (min !== undefined && val < min) {
+    throw new Error(`Invalid ${key}: must be >= ${min}, got ${val}`);
+  }
+  if (max !== undefined && val > max) {
+    throw new Error(`Invalid ${key}: must be <= ${max}, got ${val}`);
+  }
+  return val;
+}
+
 export function loadConfig(): CrankerConfig {
   const rpcUrl = process.env['SOLANA_RPC_URL'];
   if (!rpcUrl) {
@@ -104,7 +132,7 @@ export function loadConfig(): CrankerConfig {
   return {
     solanaRpcUrl: rpcUrl,
     solanaKeypairPath: keypairPath,
-    pollIntervalMs: parseIntEnv('POLL_INTERVAL_MS', '10000', 1000),
+    pollIntervalMs: parseIntEnvOrUndefined('POLL_INTERVAL_MS', 1000),
     batchSize: parseIntEnv('BATCH_SIZE', '15', 1),
     enableCloseEpochs: envOrDefault('ENABLE_CLOSE_EPOCHS', 'true') === 'true',
     epochRetention: parseIntEnv('EPOCH_RETENTION', '7', 1),
@@ -120,7 +148,7 @@ export function loadConfig(): CrankerConfig {
     garProgramId: process.env['ARIO_GAR_PROGRAM_ID'] || undefined,
     arnsProgramId: process.env['ARIO_ARNS_PROGRAM_ID'] || undefined,
     enableCleanup: envOrDefault('ENABLE_CLEANUP', 'true') === 'true',
-    cleanupMinIntervalMs: parseIntEnv('CLEANUP_MIN_INTERVAL_MS', '300000', 30_000),
+    cleanupMinIntervalMs: parseIntEnvOrUndefined('CLEANUP_MIN_INTERVAL_MS', 30_000),
     cleanupBatchSize: parseIntEnv('CLEANUP_BATCH_SIZE', '15', 1, 100),
     maxCleanupTxsPerCycle: parseIntEnv('MAX_CLEANUP_TXS_PER_CYCLE', '50', 1, 500),
     cleanupFailureThreshold: parseIntEnv('CLEANUP_FAILURE_THRESHOLD', '30', 1),
