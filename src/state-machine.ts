@@ -487,7 +487,15 @@ export class EpochStateMachine {
     }
     if (budget.remaining > 0) {
       try {
-        const gone = await ario.getGoneGateways();
+        // Only gateways whose leave window has elapsed AND have no remaining
+        // delegated stake are actually finalize_gone-able. getGoneGateways()
+        // over-returns every Leaving gateway, so finalizing per result reverts
+        // (LeaveWindowNotExpired / 6079) on every not-yet-eligible one each
+        // cycle — wasted simulations. getFinalizableGoneGateways(now) pre-filters
+        // to the on-chain eligibility conditions (ar-io/ar-io-sdk#685; requires
+        // @ar.io/sdk >= 4.0.3). 6079 is still mapped to not_ready as a safety net.
+        const now = Math.floor(Date.now() / 1000);
+        const gone = await ario.getFinalizableGoneGateways(now);
         for (const g of gone) {
           if (budget.remaining <= 0) break;
           try {
