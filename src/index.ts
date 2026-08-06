@@ -22,6 +22,11 @@ import {
   createSolanaRpcSubscriptions,
 } from '@solana/kit';
 import { loadConfig, type CrankerConfig } from './config.js';
+import {
+  deriveCrankIntervals,
+  FALLBACK_POLL_INTERVAL_MS,
+  FALLBACK_CLEANUP_MIN_INTERVAL_MS,
+} from './adaptive-intervals.js';
 import { EpochStateMachine, type CrankerLogger, type EpochSettings } from './state-machine.js';
 import { startHealthServer, type CrankerMetrics } from './health.js';
 
@@ -59,7 +64,8 @@ Required env vars:
   SOLANA_KEYPAIR_PATH         Path to signer keypair JSON
 
 Optional env vars:
-  POLL_INTERVAL_MS            Poll interval (default 10000, min 1000)
+  POLL_INTERVAL_MS            Poll interval ms, min 1000. Optional — derived from
+                             epoch duration when unset (~60s on 24h, 10s on short)
   BATCH_SIZE                  Tally/distribute batch size (default 15)
   ENABLE_CLOSE_EPOCHS         Close old epochs (default true)
   EPOCH_RETENTION             Epochs to retain before closing (default 7)
@@ -77,7 +83,8 @@ Optional env vars:
 
 Permissionless cleanup loop (mirrors ar-io-observer's runCleanup):
   ENABLE_CLEANUP              Master toggle (default true)
-  CLEANUP_MIN_INTERVAL_MS     Minimum ms between cleanup passes (default 300000 = 5min)
+  CLEANUP_MIN_INTERVAL_MS     Min ms between cleanup passes, min 30000. Optional —
+                             derived from epoch duration when unset (~30min on 24h, 5min on short)
   CLEANUP_BATCH_SIZE          Batch size for ArNS-record / returned-name pruning (default 15)
   MAX_CLEANUP_TXS_PER_CYCLE   Per-cycle tx cap across all cleanup sub-phases (default 50)
   CLEANUP_FAILURE_THRESHOLD   Consecutive failed observations before a gateway becomes prune-eligible (default 30)
@@ -173,7 +180,6 @@ async function main() {
 
   log.info('AR.IO Epoch Cranker starting', {
     rpcUrl: redactRpcUrl(config.solanaRpcUrl),
-    pollIntervalMs: config.pollIntervalMs,
     batchSize: config.batchSize,
     epochRetention: config.epochRetention,
     logFormat: config.logFormat,
@@ -268,6 +274,36 @@ async function main() {
     };
   };
 
+  // Size poll + cleanup cadence to the epoch duration unless the operator set
+  // explicit values. One read at startup; a restart re-derives if the network
+  // ever changes epoch length. Fall back to static defaults on a read error.
+  let derived = {
+    pollIntervalMs: FALLBACK_POLL_INTERVAL_MS,
+    cleanupMinIntervalMs: FALLBACK_CLEANUP_MIN_INTERVAL_MS,
+  };
+  let intervalSource = 'derived';
+  try {
+    const { epochDuration } = await readEpochSettings();
+    derived = deriveCrankIntervals(epochDuration);
+  } catch (err) {
+    intervalSource = 'fallback';
+    log.warn(
+      'Could not read epoch duration to derive cranker intervals; using static defaults',
+      { error: err instanceof Error ? err.message : String(err) },
+    );
+  }
+  const pollIntervalMs = config.pollIntervalMs ?? derived.pollIntervalMs;
+  const cleanupMinIntervalMs =
+    config.cleanupMinIntervalMs ?? derived.cleanupMinIntervalMs;
+  log.info('Cranker intervals resolved', {
+    pollIntervalMs,
+    pollIntervalSource:
+      config.pollIntervalMs !== undefined ? 'override' : intervalSource,
+    cleanupMinIntervalMs,
+    cleanupMinIntervalSource:
+      config.cleanupMinIntervalMs !== undefined ? 'override' : intervalSource,
+  });
+
   // Derive NameRegistry PDA for name prescription
   const [nameRegistryPda] = await getArnsRegistryPDA(arnsProgramId);
 
@@ -277,7 +313,7 @@ async function main() {
     contract,
     rpc,
     signer,
-    pollIntervalMs: config.pollIntervalMs,
+    pollIntervalMs,
     batchSize: config.batchSize,
     enableCloseEpochs: config.enableCloseEpochs,
     epochRetention: config.epochRetention,
@@ -287,7 +323,7 @@ async function main() {
     getEpochSettings: readEpochSettings,
     nameRegistryAccount: nameRegistryPda,
     enableCleanup: config.enableCleanup,
-    cleanupMinIntervalMs: config.cleanupMinIntervalMs,
+    cleanupMinIntervalMs,
     cleanupBatchSize: config.cleanupBatchSize,
     maxCleanupTxsPerCycle: config.maxCleanupTxsPerCycle,
     cleanupFailureThreshold: config.cleanupFailureThreshold,
@@ -306,7 +342,7 @@ async function main() {
   const healthServer = startHealthServer({
     port: config.healthPort,
     host: config.healthHost,
-    maxTickAgeMs: Math.max(config.pollIntervalMs * 3, 30000),
+    maxTickAgeMs: Math.max(pollIntervalMs * 3, 30000),
     maxConsecutiveRealErrors: 10,
     getMetrics,
   });
