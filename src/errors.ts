@@ -67,6 +67,13 @@ const NOT_READY_ERRORS = new Set<number>([
   6048,
   // EpochNotCloseable (variant 51)
   6051,
+  // LeaveWindowNotExpired (variant 79) — finalize_gone was attempted on a
+  // gateway that is leaving but whose withdrawal/leave window has not yet
+  // elapsed. This is a benign "try again later" (the window expires on its
+  // own), not an operator-actionable failure — classify as not_ready so a
+  // registry full of still-in-window leaving gateways doesn't drive the
+  // health endpoint to `unhealthy` on an otherwise-idle epoch.
+  6079,
 ]);
 
 /**
