@@ -27,7 +27,9 @@ export interface CrankEpochStepResult {
     | 'distribute'
     | 'compound'
     | 'update_demand_factor'
+    | 'prune_name_to_returned'
     | 'prune_returned_names'
+    | 'prune_expired_names'
     | 'close_observation'
     | 'close'
     | 'idle';
@@ -369,11 +371,33 @@ export class EpochStateMachine {
         this.metrics.lastActionTime = t;
         log.info('Demand factor rolled', { tx: r.txId });
         break;
+      case 'prune_name_to_returned':
+        this.metrics.phase = 'prune_name_to_returned';
+        this.metrics.returnedNamesPruneBatches++;
+        this.metrics.lastActionTime = t;
+        log.info('Pruned an expired ArNS name to returned', {
+          tx: r.txId,
+          progress: r.progress
+            ? `${r.progress.index}/${r.progress.total}`
+            : undefined,
+        });
+        break;
       case 'prune_returned_names':
         this.metrics.phase = 'prune_returned_names';
         this.metrics.returnedNamesPruneBatches++;
         this.metrics.lastActionTime = t;
         log.info('Pruned expired returned names', {
+          tx: r.txId,
+          progress: r.progress
+            ? `${r.progress.index}/${r.progress.total}`
+            : undefined,
+        });
+        break;
+      case 'prune_expired_names':
+        this.metrics.phase = 'prune_expired_names';
+        this.metrics.returnedNamesPruneBatches++;
+        this.metrics.lastActionTime = t;
+        log.info('Pruned expired ArNS names to returned', {
           tx: r.txId,
           progress: r.progress
             ? `${r.progress.index}/${r.progress.total}`
