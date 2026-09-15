@@ -30,6 +30,13 @@ jobs:
       - name: Type-check
         run: npm run typecheck
 
+      # The unit suite gates CI. It did not before, which is how the GAR error
+      # table in src/errors.ts drifted two positions and shipped: typecheck and
+      # build both pass happily against wrong constants, and nothing else looks
+      # at them. See #18.
+      - name: Test
+        run: npm test
+
       - name: Build
         run: npm run build
 
