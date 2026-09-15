@@ -7,16 +7,45 @@
  * - "not_ready": Preconditions not met yet. Wait and retry.
  * - "real": Unexpected failure. Needs investigation.
  *
- * IMPORTANT: Anchor assigns error codes as 6000 + variant-index in the
- * enum declared at `contracts/programs/ario-gar/src/error.rs`. Keep this
- * table in sync when new variants are added or reordered.
+ * Codes come from `@ar.io/solana-contracts`, generated from the shipped IDL.
+ * They are NOT written out numerically here, and must not be: Anchor assigns
+ * `6000 + variant-index`, so inserting a variant anywhere but the end of
+ * `GarError` shifts every later code. That has already happened once — this
+ * table drifted two positions and silently mis-classified a block of errors:
+ *
+ *   suppressed as "already_done" but actually real
+ *     6037 NotPrescribedObserver, 6041 InvalidObservation,
+ *     6045 NoNamesAvailable, 6049 InvalidGatewayAccount
+ *   suppressed as "not_ready" but actually real
+ *     6032 EpochsAlreadyEnabled, 6038 AlreadyObserved, 6046 InvalidEpochIndex
+ *   genuinely benign, but reported as real (alert noise, and enough of them
+ *   in a row trips the health check)
+ *     RewardsAlreadyDistributed, EpochAlreadyExists, WeightsAlreadyTallied,
+ *     EpochInProgress, DistributionIncomplete, PrescriptionsNotDone,
+ *     EpochNotCloseable
+ *
+ * Importing the generated constants makes that class of bug impossible.
  */
+
+import {
+  ARIO_GAR_ERROR__DELEGATION_NOT_DISABLED,
+  ARIO_GAR_ERROR__DISTRIBUTION_INCOMPLETE,
+  ARIO_GAR_ERROR__EPOCH_ALREADY_EXISTS,
+  ARIO_GAR_ERROR__EPOCH_IN_PROGRESS,
+  ARIO_GAR_ERROR__EPOCH_NOT_CLOSEABLE,
+  ARIO_GAR_ERROR__EPOCH_NOT_STARTED,
+  ARIO_GAR_ERROR__EPOCHS_NOT_ENABLED,
+  ARIO_GAR_ERROR__LEAVE_WINDOW_NOT_EXPIRED,
+  ARIO_GAR_ERROR__PRESCRIPTIONS_ALREADY_DONE,
+  ARIO_GAR_ERROR__PRESCRIPTIONS_NOT_DONE,
+  ARIO_GAR_ERROR__REWARDS_ALREADY_DISTRIBUTED,
+  ARIO_GAR_ERROR__WEIGHTS_ALREADY_TALLIED,
+  ARIO_GAR_ERROR__WEIGHTS_NOT_TALLIED,
+} from '@ar.io/solana-contracts/gar';
 
 export type ErrorCategory = 'already_done' | 'not_ready' | 'real';
 
-// GarError variant indexes (verified against ario-gar/src/error.rs).
-// Anchor codes = 6000 + index.
-const ALREADY_DONE_ERRORS = new Set<number>([
+export const ALREADY_DONE_ERRORS = new Set<number>([
   // AlreadyInitialized (Anchor built-in) — epoch account already exists
   0,
   // Anchor framework account-error codes that all map to the same
@@ -37,44 +66,47 @@ const ALREADY_DONE_ERRORS = new Set<number>([
   //          close."
   3007,
   3012,
-  // RewardsAlreadyDistributed (variant 37)
-  6037,
-  // EpochAlreadyExists (variant 41)
-  6041,
-  // WeightsAlreadyTallied (variant 45)
-  6045,
-  // PrescriptionsAlreadyDone (variant 49)
-  6049,
+  // Another cranker got there first — every one of these means the step
+  // this cycle wanted to perform is already done.
+  ARIO_GAR_ERROR__REWARDS_ALREADY_DISTRIBUTED,
+  ARIO_GAR_ERROR__EPOCH_ALREADY_EXISTS,
+  ARIO_GAR_ERROR__WEIGHTS_ALREADY_TALLIED,
+  ARIO_GAR_ERROR__PRESCRIPTIONS_ALREADY_DONE,
   // DelegationNotDisabled — the disabled-gateway delegate sweep (Phase 8)
   // raced an operator re-enabling delegation between discovery and the claim
-  // landing; nothing left to crank for that gateway. Appended at the end of
-  // GarError (codes stay stable), so this is the current index.
-  6091,
+  // landing; nothing left to crank for that gateway.
+  ARIO_GAR_ERROR__DELEGATION_NOT_DISABLED,
 ]);
 
-const NOT_READY_ERRORS = new Set<number>([
-  // EpochsNotEnabled (variant 31)
-  6031,
-  // EpochNotStarted (variant 32)
-  6032,
-  // EpochInProgress (variant 34) — epoch still running
-  6034,
-  // DistributionIncomplete (variant 38)
-  6038,
-  // WeightsNotTallied (variant 46)
-  6046,
-  // PrescriptionsNotDone (variant 48)
-  6048,
-  // EpochNotCloseable (variant 51)
-  6051,
-  // LeaveWindowNotExpired (variant 79) — a Leaving gateway whose leave window
-  // hasn't elapsed yet can't be finalize_gone'd. `getGoneGateways()` returns
-  // every Leaving gateway (not just expired ones), so the cleanup pass attempts
-  // them and they revert with this until their window passes — a wait-and-retry
-  // condition, NOT a real error (must not spam error logs or trip unhealthy via
-  // consecutiveRealErrors).
-  6079,
+export const NOT_READY_ERRORS = new Set<number>([
+  ARIO_GAR_ERROR__EPOCHS_NOT_ENABLED,
+  ARIO_GAR_ERROR__EPOCH_NOT_STARTED,
+  // EpochInProgress — the epoch is still running, so it cannot be distributed
+  // yet. Reached on every cycle before the window closes.
+  ARIO_GAR_ERROR__EPOCH_IN_PROGRESS,
+  ARIO_GAR_ERROR__DISTRIBUTION_INCOMPLETE,
+  ARIO_GAR_ERROR__WEIGHTS_NOT_TALLIED,
+  ARIO_GAR_ERROR__PRESCRIPTIONS_NOT_DONE,
+  ARIO_GAR_ERROR__EPOCH_NOT_CLOSEABLE,
+  // LeaveWindowNotExpired — a Leaving gateway whose leave window hasn't
+  // elapsed yet can't be finalize_gone'd. `getGoneGateways()` returns every
+  // Leaving gateway (not just expired ones), so the cleanup pass attempts them
+  // and they revert with this until their window passes — a wait-and-retry
+  // condition, NOT a real error (must not spam error logs or trip unhealthy
+  // via consecutiveRealErrors).
+  ARIO_GAR_ERROR__LEAVE_WINDOW_NOT_EXPIRED,
 ]);
+
+// Deliberately NOT suppressed — both mean an epoch needs a human, and the
+// default 'real' classification is correct:
+//   EpochWeightsClobbered (6097) — an epoch in the reward set lost its weights
+//     to another epoch's tally; it can never be distributed correctly and needs
+//     a write-off (admin_close_stale_epoch).
+//   EpochNoLongerLive (6098) — tally was attempted on a non-live epoch, which
+//     means that epoch can never be tallied and something drove the crank out
+//     of order.
+// They become imported constants once this repo is on @ar.io/solana-contracts
+// >= 1.3.0; until then they fall through to 'real', which is the same outcome.
 
 /**
  * Walk the `cause` chain on a thrown error and concatenate every
