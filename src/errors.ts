@@ -105,8 +105,9 @@ export const NOT_READY_ERRORS = new Set<number>([
 //   EpochNoLongerLive (6098) — tally was attempted on a non-live epoch, which
 //     means that epoch can never be tallied and something drove the crank out
 //     of order.
-// They become imported constants once this repo is on @ar.io/solana-contracts
-// >= 1.3.0; until then they fall through to 'real', which is the same outcome.
+// Their codes are pinned against the generated constants in errors.test.ts, so a
+// future renumbering fails the suite rather than silently changing what the
+// cranker suppresses.
 
 /**
  * Walk the `cause` chain on a thrown error and concatenate every

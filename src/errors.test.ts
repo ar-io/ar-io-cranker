@@ -1,6 +1,11 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
+import {
+  ARIO_GAR_ERROR__EPOCH_NO_LONGER_LIVE,
+  ARIO_GAR_ERROR__EPOCH_WEIGHTS_CLOBBERED,
+} from '@ar.io/solana-contracts/gar';
+
 import { classifyError } from './errors.js';
 
 describe('classifyError — LeaveWindowNotExpired (6079)', () => {
@@ -81,11 +86,18 @@ describe('classifyError — drifted-table regressions', () => {
   });
 
   it('surfaces the ADR-0032/0033 errors as real — they need a human', () => {
-    // Numeric until this repo is on @ar.io/solana-contracts >= 1.3.0, which is
-    // the first release whose IDL carries them:
-    //   6097 EpochWeightsClobbered — epoch can never be distributed correctly
-    //   6098 EpochNoLongerLive     — epoch can never be tallied
-    assert.equal(classifyError(anchor(6097)), 'real');
-    assert.equal(classifyError(anchor(6098)), 'real');
+    // Pinned against the generated constants rather than written out, so a
+    // renumbering in a future IDL fails here instead of silently changing what
+    // the cranker suppresses:
+    //   EpochWeightsClobbered — epoch can never be distributed correctly
+    //   EpochNoLongerLive     — epoch can never be tallied
+    assert.equal(ARIO_GAR_ERROR__EPOCH_WEIGHTS_CLOBBERED, 6097);
+    assert.equal(ARIO_GAR_ERROR__EPOCH_NO_LONGER_LIVE, 6098);
+    for (const code of [
+      ARIO_GAR_ERROR__EPOCH_WEIGHTS_CLOBBERED,
+      ARIO_GAR_ERROR__EPOCH_NO_LONGER_LIVE,
+    ]) {
+      assert.equal(classifyError(anchor(code)), 'real');
+    }
   });
 });
