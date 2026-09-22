@@ -4,6 +4,8 @@ import { describe, it } from 'node:test';
 import {
   ARIO_GAR_ERROR__EPOCH_NO_LONGER_LIVE,
   ARIO_GAR_ERROR__EPOCH_WEIGHTS_CLOBBERED,
+  ARIO_GAR_ERROR__LATEST_EPOCH_UNFINISHED,
+  ARIO_GAR_ERROR__MISSING_LATEST_EPOCH_ACCOUNT,
 } from '@ar.io/solana-contracts/gar';
 
 import { classifyError } from './errors.js';
@@ -99,5 +101,39 @@ describe('classifyError — drifted-table regressions', () => {
     ]) {
       assert.equal(classifyError(anchor(code)), 'real');
     }
+  });
+});
+
+describe('classifyError — Wave 2 (ADR-0034 / ADR-0036)', () => {
+  const anchor = (code: number) =>
+    new Error(`AnchorError. Error Number: ${code}.`);
+
+  // The Wave 2 program upgrade makes `finalize_gone` refuse for the whole
+  // window between an epoch's creation and its distribution (registry
+  // positions are frozen while an epoch is unfinished). The cleanup pass runs
+  // every cycle, so this becomes the STEADY STATE, not an edge case.
+  //
+  // If it were left to the default 'real' classification, the upgrade would
+  // make a correctly-behaving cranker log errors on most cycles, accumulate
+  // `consecutiveRealErrors` and trip its own health check.
+  it('treats LatestEpochUnfinished as not_ready, not a real error', () => {
+    assert.equal(ARIO_GAR_ERROR__LATEST_EPOCH_UNFINISHED, 6102);
+    assert.equal(
+      classifyError(anchor(ARIO_GAR_ERROR__LATEST_EPOCH_UNFINISHED)),
+      'not_ready',
+    );
+  });
+
+  // Deliberately the opposite call. This one means the CRANKER is stale — it
+  // did not send the latest Epoch PDA that ADR-0034's predicate requires — so
+  // it must be loud rather than retried quietly. Anchor derives these two
+  // codes adjacently, which is exactly why they are pinned by value here: a
+  // renumbering that swapped them would silently invert both behaviours.
+  it('treats MissingLatestEpochAccount as a real error', () => {
+    assert.equal(ARIO_GAR_ERROR__MISSING_LATEST_EPOCH_ACCOUNT, 6103);
+    assert.equal(
+      classifyError(anchor(ARIO_GAR_ERROR__MISSING_LATEST_EPOCH_ACCOUNT)),
+      'real',
+    );
   });
 });

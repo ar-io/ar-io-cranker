@@ -35,6 +35,7 @@ import {
   ARIO_GAR_ERROR__EPOCH_NOT_CLOSEABLE,
   ARIO_GAR_ERROR__EPOCH_NOT_STARTED,
   ARIO_GAR_ERROR__EPOCHS_NOT_ENABLED,
+  ARIO_GAR_ERROR__LATEST_EPOCH_UNFINISHED,
   ARIO_GAR_ERROR__LEAVE_WINDOW_NOT_EXPIRED,
   ARIO_GAR_ERROR__PRESCRIPTIONS_ALREADY_DONE,
   ARIO_GAR_ERROR__PRESCRIPTIONS_NOT_DONE,
@@ -95,10 +96,31 @@ export const NOT_READY_ERRORS = new Set<number>([
   // condition, NOT a real error (must not spam error logs or trip unhealthy
   // via consecutiveRealErrors).
   ARIO_GAR_ERROR__LEAVE_WINDOW_NOT_EXPIRED,
+  // LatestEpochUnfinished (6102, ADR-0036/ADR-0034) — registry positions are
+  // frozen while an epoch is unfinished, so `finalize_gone` is refused for the
+  // WHOLE window between an epoch's creation and its distribution. The cleanup
+  // pass runs every cycle and will therefore hit this on MOST cycles, not
+  // occasionally: ADR-0036 narrows GC to the gap between one epoch's
+  // distribution and the next epoch's creation.
+  //
+  // Without this entry the Wave 2 program upgrade turns routine sweeps into
+  // logged "real" errors that accumulate in `consecutiveRealErrors` and trip
+  // the health check — the cranker would report unhealthy while behaving
+  // exactly as designed. `create_epoch` raises the same code when the previous
+  // epoch is not finished, which is likewise a wait-and-retry.
+  //
+  // The race-free alternative ADR-0036 names is bundling `finalize_gone` into
+  // the SAME transaction as the final `distribute_epoch` batch. Until the
+  // cranker does that, this is the expected steady state.
+  ARIO_GAR_ERROR__LATEST_EPOCH_UNFINISHED,
 ]);
 
-// Deliberately NOT suppressed — both mean an epoch needs a human, and the
+// Deliberately NOT suppressed — each means an epoch needs a human, and the
 // default 'real' classification is correct:
+//   MissingLatestEpochAccount (6103) — the client did not supply the latest
+//     Epoch PDA that ADR-0034's predicate requires. Distinct from
+//     LatestEpochUnfinished on purpose: it means the CRANKER is stale, not
+//     that the chain is busy, so it must be loud rather than retried quietly.
 //   EpochWeightsClobbered (6097) — an epoch in the reward set lost its weights
 //     to another epoch's tally; it can never be distributed correctly and needs
 //     a write-off (admin_close_stale_epoch).
