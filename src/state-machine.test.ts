@@ -80,7 +80,13 @@ function makeStateMachine(
 
 // runCycle is private; drive it directly.
 // biome-ignore lint/suspicious/noExplicitAny: test reaches a private method
-const runCycle = (sm: EpochStateMachine) => (sm as any).runCycle();
+// `runCycle` is reached directly here, bypassing start()/tick(). The drain
+// loop honours `running` so that stop() halts it promptly, so these harnesses
+// must set it the way a live cranker would.
+const runCycle = (sm: EpochStateMachine) => {
+  (sm as any).running = true;
+  return (sm as any).runCycle();
+};
 
 describe('EpochStateMachine.runCycle (crankEpochStep delegation)', () => {
   it('passes batchSize / enableClose / epochRetention / nameRegistry to crankEpochStep', async () => {
@@ -325,6 +331,27 @@ describe('EpochStateMachine.runCycle — draining multi-batch phases', () => {
     }, { maxStepsPerCycle: 7 });
     await runCycle(sm);
     assert.equal(crankCalls.length, 7, 'never exceeds maxStepsPerCycle');
+  });
+
+  it('stops stepping when the cranker is stopped mid-drain', async () => {
+    // Without this the drain keeps submitting for the whole budget after
+    // stop() — up to 50 further transactions during a shutdown or redeploy.
+    // The hazard arrives WITH the drain: a cycle used to be a single step.
+    let i = 0;
+    let smRef: EpochStateMachine | undefined;
+    const { sm, crankCalls } = makeStateMachine(async () => {
+      i += 1;
+      if (i === 2) smRef?.stop();
+      return {
+        action: 'distribute',
+        epochIndex: 4,
+        txId: `t${i}`,
+        progress: { index: i, total: 10_000 },
+      };
+    });
+    smRef = sm;
+    await runCycle(sm);
+    assert.equal(crankCalls.length, 2, 'no further steps after stop()');
   });
 
   it('ends the drain when a step throws, keeping the error classified', async () => {
