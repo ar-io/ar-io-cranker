@@ -326,6 +326,8 @@ async function main() {
     cleanupMinIntervalMs,
     cleanupBatchSize: config.cleanupBatchSize,
     maxCleanupTxsPerCycle: config.maxCleanupTxsPerCycle,
+    maxStepsPerCycle: config.maxCrankStepsPerCycle,
+    maxStepMs: config.maxCrankStepMs,
     cleanupFailureThreshold: config.cleanupFailureThreshold,
     altReclaimScanLimit: config.altReclaimScanLimit,
     enableDisabledGatewaySweep: config.enableDisabledGatewaySweep,

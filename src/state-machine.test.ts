@@ -16,6 +16,25 @@ const noopLog = {
   error() {},
 };
 
+/**
+ * A stub that yields `result` once and then `idle` — i.e. one unit of work and
+ * a quiescent tail, which is what a real cycle looks like.
+ *
+ * The state machine DRAINS `crankEpochStep` until it reports `idle`, so a stub
+ * that returns the same non-idle result forever models a wedged lifecycle, not
+ * a normal one. (That case is covered explicitly by the drain tests below.)
+ */
+function once(
+  result: CrankEpochStepResult,
+): () => Promise<CrankEpochStepResult> {
+  let done = false;
+  return async () => {
+    if (done) return { action: 'idle', reason: 'epoch_complete' };
+    done = true;
+    return result;
+  };
+}
+
 const enabledSettings: EpochSettings = {
   currentEpochIndex: 5,
   genesisTimestamp: 0,
@@ -87,21 +106,30 @@ describe('EpochStateMachine.runCycle (crankEpochStep delegation)', () => {
   });
 
   it('maps a prescribe action to metrics', async () => {
-    const { sm } = makeStateMachine({ action: 'prescribe', epochIndex: 4, txId: 'tx1' });
+    const { sm } = makeStateMachine(
+      once({ action: 'prescribe', epochIndex: 4, txId: 'tx1' }),
+    );
     await runCycle(sm);
     const m = sm.getMetrics();
-    assert.equal(m.prescriptions, 1);
-    assert.equal(m.phase, 'prescribe_epoch');
+    assert.equal(m.prescriptions, 1, 'the work is still counted');
     assert.notEqual(m.lastActionTime, '');
+    // `phase` now reports the cycle's END STATE, not the single step it took.
+    // Draining to `idle` means the cranker genuinely has nothing left to do,
+    // and saying so is more accurate than reporting the last thing it did.
+    // Work performed is still visible in the counters and in
+    // `crankStepsLastCycle`.
+    assert.equal(m.phase, 'epoch_complete');
   });
 
   it('maps a tally action with progress', async () => {
-    const { sm } = makeStateMachine({
-      action: 'tally',
-      epochIndex: 4,
-      txId: 'tx2',
-      progress: { index: 25, total: 667 },
-    });
+    const { sm } = makeStateMachine(
+      once({
+        action: 'tally',
+        epochIndex: 4,
+        txId: 'tx2',
+        progress: { index: 25, total: 667 },
+      }),
+    );
     await runCycle(sm);
     const m = sm.getMetrics();
     assert.equal(m.tallyBatches, 1);
@@ -114,7 +142,9 @@ describe('EpochStateMachine.runCycle (crankEpochStep delegation)', () => {
       ['distribute', 'distributionBatches'],
       ['close', 'epochsClosed'],
     ] as const) {
-      const { sm } = makeStateMachine({ action, epochIndex: 1, txId: 't' });
+      const { sm } = makeStateMachine(
+        once({ action, epochIndex: 1, txId: 't' }),
+      );
       await runCycle(sm);
       assert.equal(
         (sm.getMetrics() as unknown as Record<string, unknown>)[field],
@@ -219,6 +249,101 @@ function makeCleanupSM(opts: {
   };
   return { sm: new EpochStateMachine(config), claimCalls };
 }
+
+describe('EpochStateMachine.runCycle — draining multi-batch phases', () => {
+  // `crankEpochStep` advances the lifecycle by ONE step. Distribution is one
+  // tx per ~15 gateways and the post-distribution compound sweep is one tx per
+  // 6 delegations, so at one step per cycle those became one tx per CYCLE: on
+  // staging a single rollover spent ~42 minutes distributing 617 gateways, and
+  // compound (542 delegations, ~91 batches) sat in front of "create the next
+  // epoch" — which is why the next epoch was over two hours late.
+
+  it('keeps stepping until idle instead of one step per cycle', async () => {
+    // 5 distribute batches then idle — one cycle should do all of them.
+    let n = 0;
+    const { sm, crankCalls } = makeStateMachine(async () => {
+      if (n >= 5) return { action: 'idle', reason: 'epoch_complete' };
+      n += 1;
+      return {
+        action: 'distribute',
+        epochIndex: 4,
+        txId: `tx${n}`,
+        progress: { index: n * 15, total: 75 },
+      };
+    });
+    await runCycle(sm);
+    assert.equal(crankCalls.length, 6, '5 batches + the idle that ends the drain');
+    assert.equal(sm.getMetrics().distributionBatches, 5);
+    assert.equal(sm.getMetrics().crankStepsLastCycle, 6);
+  });
+
+  it('drains a compound sweep, whose progress shrinks `total` rather than advancing `index`', async () => {
+    // The compound step reports {index: batchSize, total: remaining}, so
+    // `index` is constant at 6 while `total` falls. A progress check that only
+    // watched `index` would mistake that for no progress and stop after one
+    // batch — reintroducing the bug.
+    let remaining = 30;
+    const { sm } = makeStateMachine(async () => {
+      if (remaining <= 0) return { action: 'idle', reason: 'epoch_complete' };
+      remaining -= 6;
+      return {
+        action: 'compound',
+        txId: 'c',
+        progress: { index: 6, total: remaining + 6 },
+      };
+    });
+    await runCycle(sm);
+    assert.equal(sm.getMetrics().crankStepsLastCycle, 6, '5 batches + idle');
+  });
+
+  it('stops when a step repeats with no progress, rather than firing the whole budget', async () => {
+    // A wedged lifecycle must cost ONE extra tx, not 50.
+    const { sm, crankCalls } = makeStateMachine({
+      action: 'distribute',
+      epochIndex: 4,
+      txId: 'stuck',
+      progress: { index: 15, total: 600 },
+    });
+    await runCycle(sm);
+    assert.equal(
+      crankCalls.length,
+      2,
+      'one step, one identical repeat, then stop',
+    );
+  });
+
+  it('respects the per-cycle step budget', async () => {
+    let i = 0;
+    const { sm, crankCalls } = makeStateMachine(async () => {
+      i += 1;
+      return {
+        action: 'distribute',
+        epochIndex: 4,
+        txId: `t${i}`,
+        progress: { index: i, total: 10_000 },
+      };
+    }, { maxStepsPerCycle: 7 });
+    await runCycle(sm);
+    assert.equal(crankCalls.length, 7, 'never exceeds maxStepsPerCycle');
+  });
+
+  it('ends the drain when a step throws, keeping the error classified', async () => {
+    let i = 0;
+    const { sm, crankCalls } = makeStateMachine(async () => {
+      i += 1;
+      if (i === 3) throw new Error('AnchorError. Error Number: 9999.');
+      return {
+        action: 'distribute',
+        epochIndex: 4,
+        txId: `t${i}`,
+        progress: { index: i, total: 100 },
+      };
+    });
+    await runCycle(sm);
+    assert.equal(crankCalls.length, 3, 'stops at the throwing step');
+    assert.equal(sm.getMetrics().consecutiveRealErrors, 1);
+  });
+});
 
 describe('EpochStateMachine cleanup — disabled-gateway delegate sweep (Phase 8)', () => {
   it('claims every delegate of each disabled gateway that still holds stake', async () => {
