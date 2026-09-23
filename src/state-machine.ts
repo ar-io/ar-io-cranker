@@ -330,7 +330,11 @@ export class EpochStateMachine {
     let steps = 0;
     let lastFingerprint: string | null = null;
     try {
-      while (steps < maxSteps && Date.now() < deadline) {
+      // `this.running` is re-checked every iteration so stop() halts the drain
+      // promptly. Without it a shutdown mid-drain would keep submitting for up
+      // to the full budget — a hazard the drain introduces, since a cycle used
+      // to be a single step and stop() therefore took effect almost at once.
+      while (this.running && steps < maxSteps && Date.now() < deadline) {
         const result = await contract.crankEpochStep({
           batchSize: this.config.batchSize,
           enableClose: this.config.enableCloseEpochs,
