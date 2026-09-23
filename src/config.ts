@@ -38,6 +38,10 @@ export interface CrankerConfig {
   cleanupBatchSize: number;
   /** Per-cycle tx cap across all cleanup sub-phases. Default 50. */
   maxCleanupTxsPerCycle: number;
+  /** Max `crankEpochStep` calls per cycle (drain depth). */
+  maxCrankStepsPerCycle: number;
+  /** Wall-clock budget for the drain loop, ms. */
+  maxCrankStepMs: number;
   /** Consecutive failed observations before a gateway is prune-eligible. Default 30. */
   cleanupFailureThreshold: number;
   /**
@@ -151,6 +155,11 @@ export function loadConfig(): CrankerConfig {
     cleanupMinIntervalMs: parseIntEnvOrUndefined('CLEANUP_MIN_INTERVAL_MS', 30_000),
     cleanupBatchSize: parseIntEnv('CLEANUP_BATCH_SIZE', '15', 1, 100),
     maxCleanupTxsPerCycle: parseIntEnv('MAX_CLEANUP_TXS_PER_CYCLE', '50', 1, 500),
+    // Drain multi-batch phases within a cycle instead of one tx per cycle.
+    // 45s keeps a drain inside a typical 60s interval; whatever does not fit
+    // simply continues next cycle.
+    maxCrankStepsPerCycle: parseIntEnv('MAX_CRANK_STEPS_PER_CYCLE', '50', 1, 500),
+    maxCrankStepMs: parseIntEnv('MAX_CRANK_STEP_MS', '45000', 1000, 600_000),
     cleanupFailureThreshold: parseIntEnv('CLEANUP_FAILURE_THRESHOLD', '30', 1),
     altReclaimScanLimit: parseIntEnv('ALT_RECLAIM_SCAN_LIMIT', '200', 0, 1000),
     enableDisabledGatewaySweep:

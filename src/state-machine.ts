@@ -18,6 +18,20 @@ const LAMPORTS_PER_SOL = 1_000_000_000;
 //
 // The type is defined inline here to avoid a direct import dependency on the SDK
 // build artifacts. The actual object passed in must have these methods.
+/**
+ * Default cap on `crankEpochStep` calls per cycle. 50 mirrors the existing
+ * `MAX_CLEANUP_TXS_PER_CYCLE` budget, and comfortably covers a full
+ * distribution pass (~41 batches at 617 gateways / batchSize 15).
+ */
+export const DEFAULT_MAX_STEPS_PER_CYCLE = 50;
+
+/**
+ * Default wall-clock budget for the drain loop. Deliberately below a typical
+ * 60s cycle interval so a long drain cannot push the next cycle late; whatever
+ * is left simply continues next cycle, exactly as it does today.
+ */
+export const DEFAULT_MAX_STEP_MS = 45_000;
+
 /** Result of one `SolanaARIOWriteable.crankEpochStep()` call (mirrors @ar.io/sdk). */
 export interface CrankEpochStepResult {
   action:
@@ -108,6 +122,34 @@ export interface StateMachineConfig {
   altReclaimScanLimit?: number;
   /** Sweep delegates out of gateways with delegation disabled (Phase 8 — Fix #6). Default true. */
   enableDisabledGatewaySweep?: boolean;
+  /**
+   * Maximum `crankEpochStep` calls per cycle. Default
+   * {@link DEFAULT_MAX_STEPS_PER_CYCLE}. Env: MAX_CRANK_STEPS_PER_CYCLE.
+   *
+   * `crankEpochStep` advances the lifecycle by exactly ONE step, and several
+   * steps are inherently multi-batch: distribution is one tx per ~15 gateways,
+   * and the post-distribution compound sweep is one tx per 6 delegations. At
+   * one step per cycle those become one tx per CYCLE, so on a 617-gateway /
+   * 542-delegation registry a single rollover spent ~42 minutes distributing
+   * and would have spent ~91 more compounding — and because compound is
+   * sequenced immediately before "create the next epoch", the next epoch
+   * cannot be created until the sweep drains.
+   *
+   * Draining within a cycle changes no instruction, no ordering and no
+   * on-chain semantics. It only stops the cranker idling between batches it
+   * was always going to send.
+   */
+  maxStepsPerCycle?: number;
+  /**
+   * Wall-clock budget for the drain loop, in ms. Default
+   * {@link DEFAULT_MAX_STEP_MS}. Env: MAX_CRANK_STEP_MS.
+   *
+   * In practice this binds before {@link maxStepsPerCycle}: each step is a
+   * confirmed transaction, so step latency — not the step count — decides how
+   * many fit. Keep it below the cycle interval so a cycle cannot overrun the
+   * next one.
+   */
+  maxStepMs?: number;
 }
 
 export interface StateMachineMetrics {
@@ -115,6 +157,8 @@ export interface StateMachineMetrics {
   phase: string;
   tallyProgress: string;
   distributionProgress: string;
+  /** `crankEpochStep` calls made in the most recent cycle (drain depth). */
+  crankStepsLastCycle: number;
   lastActionTime: string;
   lastTickTime: string;
   walletBalanceSol: string;
@@ -148,6 +192,7 @@ export class EpochStateMachine {
     currentEpoch: 0,
     phase: 'idle',
     tallyProgress: '0/0',
+    crankStepsLastCycle: 0,
     distributionProgress: '0/0',
     lastActionTime: '',
     lastTickTime: '',
@@ -271,24 +316,66 @@ export class EpochStateMachine {
     // whole registry — the fix for MAX_TX_ACCOUNT_LOCKS) and the
     // InvalidGatewayAccount re-predict-and-retry. We only map the result to
     // metrics/logging and classify any thrown error.
+    // DRAIN, don't single-step. `crankEpochStep` advances the lifecycle by one
+    // step; multi-batch phases (distribute, compound) therefore used to take
+    // one CYCLE per batch. Keep calling it until it reports `idle` — meaning
+    // there is genuinely nothing left to do — or a budget is hit.
+    //
+    // This sends exactly the instructions it always sent, in the same order.
+    // The only thing removed is the idle gap between them.
     let action: CrankEpochStepResult['action'] | undefined;
+    const maxSteps = this.config.maxStepsPerCycle ?? DEFAULT_MAX_STEPS_PER_CYCLE;
+    const deadline =
+      Date.now() + (this.config.maxStepMs ?? DEFAULT_MAX_STEP_MS);
+    let steps = 0;
+    let lastFingerprint: string | null = null;
     try {
-      const result = await contract.crankEpochStep({
-        batchSize: this.config.batchSize,
-        enableClose: this.config.enableCloseEpochs,
-        epochRetention: this.config.epochRetention ?? 7,
-        nameRegistryAccount: this.config.nameRegistryAccount,
-        // Returned-name pruning is folded into the epoch step (solana.36+):
-        // tie it to the same cleanup config the runCleanup phases use.
-        enablePrune: this.config.enableCleanup !== false,
-        pruneBatchSize: this.config.cleanupBatchSize,
-        pruneScanIntervalMs: this.config.cleanupMinIntervalMs,
-      });
-      this.applyCrankResult(result);
-      action = result.action;
+      while (steps < maxSteps && Date.now() < deadline) {
+        const result = await contract.crankEpochStep({
+          batchSize: this.config.batchSize,
+          enableClose: this.config.enableCloseEpochs,
+          epochRetention: this.config.epochRetention ?? 7,
+          nameRegistryAccount: this.config.nameRegistryAccount,
+          // Returned-name pruning is folded into the epoch step (solana.36+):
+          // tie it to the same cleanup config the runCleanup phases use.
+          enablePrune: this.config.enableCleanup !== false,
+          pruneBatchSize: this.config.cleanupBatchSize,
+          pruneScanIntervalMs: this.config.cleanupMinIntervalMs,
+        });
+        this.applyCrankResult(result);
+        action = result.action;
+        steps += 1;
+        // `idle` is the quiescent tail: nothing further to advance this cycle.
+        if (result.action === 'idle') break;
+
+        // Non-progress guard. Draining only makes sense while the step is
+        // actually advancing something; a step that reports the SAME action
+        // and the same progress twice running is not making headway, and
+        // looping on it would fire the whole budget at a wedged lifecycle
+        // instead of one tx as before.
+        //
+        // The progress tuple is what distinguishes the two cases: distribution
+        // advances `index`, and the compound sweep leaves `index` at the batch
+        // size but shrinks `total` as it drains — so genuine work always moves
+        // one of them.
+        const fingerprint = `${result.action}:${result.progress?.index ?? ''}/${result.progress?.total ?? ''}`;
+        if (fingerprint === lastFingerprint) {
+          log.debug(
+            'Crank step repeated without progress; ending drain for this cycle',
+            { action: result.action, steps },
+          );
+          break;
+        }
+        lastFingerprint = fingerprint;
+      }
     } catch (err) {
+      // An error ends the drain. `action` keeps the last SUCCESSFUL action, so
+      // the cleanup gate below still sees a non-idle state and stays out of the
+      // way — the same behaviour as before, since cleanup only ran after a
+      // clean idle.
       this.handleError(err, 'crank_epoch');
     }
+    this.metrics.crankStepsLastCycle = steps;
 
     // 3. Permissionless prune / cleanup (best-effort, throttled). Gated on the
     // quiescent tail (`action === 'idle'`) so it never competes with a pending
