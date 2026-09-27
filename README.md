@@ -65,6 +65,7 @@ All settings are environment variables.
 | `BATCH_SIZE` | `15` | Tally/distribute batch size |
 | `ENABLE_CLOSE_EPOCHS` | `true` | Close old epochs |
 | `EPOCH_RETENTION` | `7` | Epochs to keep before closing |
+| `ENABLE_DISABLED_GATEWAY_SWEEP` | `true` | Claim delegations out of leaving and delegation-disabled gateways into each delegate's withdrawal vault. The cranker pays each vault's rent (at most about 0.0029 SOL, which the delegate recovers) and pauses the sweep while it holds under 0.5 SOL. |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `LOG_FORMAT` | `json` | `json` (production) / `text` (dev) |
 | `HEALTH_PORT` | `8080` | Health/metrics HTTP port |

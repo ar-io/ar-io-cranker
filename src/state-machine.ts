@@ -44,12 +44,16 @@ export interface CrankEpochStepResult {
     | 'prune_name_to_returned'
     | 'prune_returned_names'
     | 'prune_expired_names'
+    | 'finalize_gone'
+    | 'claim_delegate'
     | 'close_observation'
     | 'close'
     | 'idle';
   epochIndex?: number;
   txId?: string;
   progress?: { index: number; total: number };
+  /** Set when a batched step stopped short or skipped items after a failure. */
+  partialFailureReason?: string;
   reason?: string;
 }
 
@@ -72,6 +76,8 @@ export interface EpochCrankerContract {
     enablePrune?: boolean;
     pruneBatchSize?: number;
     pruneScanIntervalMs?: number;
+    enableFinalizeGone?: boolean;
+    enableDelegateSweep?: boolean;
   }): Promise<CrankEpochStepResult>;
 }
 
@@ -120,7 +126,11 @@ export interface StateMachineConfig {
   cleanupFailureThreshold?: number;
   /** Recent signatures to scan when reclaiming leaked prescribe ALTs (Phase 7). Default 200; 0 disables. */
   altReclaimScanLimit?: number;
-  /** Sweep delegates out of gateways with delegation disabled (Phase 8 — Fix #6). Default true. */
+  /**
+   * Let crankEpochStep claim delegations out of leaving and
+   * delegation-disabled gateways (ar-io/ar-io-sdk#756). Default true. The name
+   * predates the leaving-gateway half and is kept for existing deployments.
+   */
   enableDisabledGatewaySweep?: boolean;
   /**
    * Maximum `crankEpochStep` calls per cycle. Default
@@ -345,6 +355,17 @@ export class EpochStateMachine {
           enablePrune: this.config.enableCleanup !== false,
           pruneBatchSize: this.config.cleanupBatchSize,
           pruneScanIntervalMs: this.config.cleanupMinIntervalMs,
+          // Gateway lifecycle (ar-io/ar-io-sdk#756). finalize_gone runs in the
+          // window between distribution and create_epoch, the only time
+          // ADR-0036 allows it. The delegate sweep moves delegations off
+          // leaving and delegation-disabled gateways into their delegates'
+          // withdrawal vaults during the observation window; it pays each
+          // vault's rent and pauses below the SDK's SOL floor, so it can't
+          // starve create_epoch.
+          enableFinalizeGone: this.config.enableCleanup !== false,
+          enableDelegateSweep:
+            this.config.enableCleanup !== false &&
+            this.config.enableDisabledGatewaySweep !== false,
         });
         this.applyCrankResult(result);
         action = result.action;
@@ -507,10 +528,40 @@ export class EpochStateMachine {
             : undefined,
         });
         break;
+      case 'finalize_gone':
+        this.metrics.phase = 'finalize_gone';
+        this.metrics.lastActionTime = t;
+        log.info('Finalized departed gateways', {
+          epochIndex: r.epochIndex,
+          tx: r.txId,
+          progress: r.progress
+            ? `${r.progress.index}/${r.progress.total}`
+            : undefined,
+        });
+        break;
+      case 'claim_delegate':
+        this.metrics.phase = 'claim_delegate';
+        this.metrics.lastActionTime = t;
+        log.info('Claimed delegations out of leaving/disabled gateways', {
+          tx: r.txId,
+          progress: r.progress
+            ? `${r.progress.index}/${r.progress.total}`
+            : undefined,
+        });
+        break;
       case 'idle':
         this.metrics.phase = r.reason ?? 'idle';
         log.debug('Idle', { reason: r.reason });
         break;
+    }
+    // Batched steps report skipped or failed items here instead of throwing.
+    // Without this a failing claim, or a sweep paused by the SOL floor, would
+    // never reach the logs.
+    if (r.partialFailureReason !== undefined) {
+      log.warn('Crank step partial failure', {
+        action: r.action,
+        reason: r.partialFailureReason,
+      });
     }
   }
 
@@ -579,7 +630,12 @@ export class EpochStateMachine {
     // gate that stranded imported returned names. Removed here so there's a
     // single source of truth — see the crankEpochStep call in runCycle.
 
-    // Phase 3: Deficient gateways → prune_gateway, plus Gone gateways → finalize_gone.
+    // Phase 3: Deficient gateways → prune_gateway.
+    //
+    // finalize_gone is NOT here. ADR-0036 lets it succeed only between an
+    // epoch's distribution and the next epoch's creation, and cleanup runs only
+    // mid-epoch, so every call here returned 6102. crankEpochStep finalizes
+    // departed gateways inside that window instead (ar-io/ar-io-sdk#756).
     if (budget.remaining > 0) {
       try {
         const deficient = await ario.getDeficientGateways(failureThreshold);
@@ -598,31 +654,6 @@ export class EpochStateMachine {
         }
       } catch (err) {
         this.handleError(err, 'cleanup_deficient_gateways_scan');
-      }
-    }
-    if (budget.remaining > 0) {
-      try {
-        // Only gateways whose leave window has elapsed AND have no remaining
-        // delegated stake are actually finalize_gone-able. getGoneGateways()
-        // over-returns every Leaving gateway, so finalizing per result reverts
-        // (LeaveWindowNotExpired / 6079) on every not-yet-eligible one each
-        // cycle — wasted simulations. getFinalizableGoneGateways(now) pre-filters
-        // to the on-chain eligibility conditions (ar-io/ar-io-sdk#685; requires
-        // @ar.io/sdk >= 4.0.3). 6079 is still mapped to not_ready as a safety net.
-        const now = Math.floor(Date.now() / 1000);
-        const gone = await ario.getFinalizableGoneGateways(now);
-        for (const g of gone) {
-          if (budget.remaining <= 0) break;
-          try {
-            await ario.finalizeGone({ gateway: g.operator });
-            budget.remaining--;
-            log.info('Finalized gone gateway', { operator: g.operator });
-          } catch (err) {
-            this.handleError(err, 'finalize_gone');
-          }
-        }
-      } catch (err) {
-        this.handleError(err, 'cleanup_gone_gateways_scan');
       }
     }
 
@@ -785,48 +816,12 @@ export class EpochStateMachine {
       }
     }
 
-    // Phase 8: Disabled-gateway delegate sweep (WP §6.3 / Fix #6). When an
-    // operator turns off `allow_delegated_staking`, existing delegates are NOT
-    // auto-withdrawn (Solana can't iterate PDAs in one tx). This permissionless
-    // crank moves each stranded delegate into its own 30-day withdrawal vault,
-    // which also unblocks the operator's re-enable (gated on
-    // total_delegated_stake == 0 + cooldown). `claimDelegateFromDisabledGateway`
-    // is permissionless: the cranker pays rent; stake routes to the delegate.
-    if (budget.remaining > 0 && this.config.enableDisabledGatewaySweep !== false) {
-      try {
-        const disabled = await ario.getDisabledGatewaysWithDelegatedStake();
-        for (const gw of disabled) {
-          if (budget.remaining <= 0) break;
-          try {
-            // Enumerate this gateway's remaining delegates and crank each out.
-            const delegates = await ario.getGatewayDelegates({
-              address: gw.operator,
-              limit: budget.remaining,
-            });
-            for (const d of delegates.items) {
-              if (budget.remaining <= 0) break;
-              // Skip delegates already drained to 0 (e.g. self-claimed earlier);
-              // claiming them would fail the `delegation.amount > 0` constraint.
-              // They're swept off by the empty-delegation phase, not here.
-              if (Number(d.delegatedStake ?? 0) <= 0) continue;
-              try {
-                await ario.claimDelegateFromDisabledGateway({
-                  gatewayAddress: gw.operator,
-                  delegatorAddress: d.address,
-                });
-                budget.remaining--;
-              } catch (err) {
-                this.handleError(err, 'claim_delegate_from_disabled_gateway');
-              }
-            }
-          } catch (err) {
-            this.handleError(err, 'disabled_gateway_delegates_scan');
-          }
-        }
-      } catch (err) {
-        this.handleError(err, 'cleanup_disabled_gateways_scan');
-      }
-    }
+    // Delegate claims (leaving and delegation-disabled gateways) are made by
+    // crankEpochStep's delegate sweep (ar-io/ar-io-sdk#756), gated on
+    // enableDisabledGatewaySweep. The Phase 8 sweep that used to live here
+    // never succeeded: the SDK's claim builder derived the GAR settings
+    // account under a placeholder program id (fixed in the same SDK PR).
+
 
     const txsSubmitted = maxTxs - budget.remaining;
     this.metrics.cleanupTxsLastCycle = txsSubmitted;

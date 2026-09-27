@@ -51,10 +51,12 @@ export interface CrankerConfig {
    */
   altReclaimScanLimit: number;
   /**
-   * Sweep delegates out of gateways whose operator DISABLED delegation
-   * (`allow_delegated_staking == false`) but that still hold delegated stake
-   * (Phase 8 — WP §6.3 / Fix #6). Without this crank, those delegates are
-   * stranded and the operator can never re-enable delegation. Default true.
+   * Let crankEpochStep claim delegations out of gateways that are leaving the
+   * network or have DISABLED delegation, into each delegate's own withdrawal
+   * vault (WP §6.3 / Fix #6; ar-io/ar-io-sdk#756). Without it those delegates
+   * are stranded: a leaving gateway can't be finalized, and an operator can't
+   * re-enable delegation. The cranker pays each vault's rent (the delegate
+   * recovers it). Default true. The env name predates the leaving-gateway half.
    */
   enableDisabledGatewaySweep: boolean;
 }
