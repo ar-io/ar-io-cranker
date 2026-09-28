@@ -197,18 +197,41 @@ function makeCleanupSM(opts: {
   /** Live balance per delegator address; defaults to 1 (active). 0 = drained. */
   delegateStakeByAddress?: Record<string, number>;
   enableDisabledGatewaySweep?: boolean;
+  enableCleanup?: boolean;
   maxCleanupTxsPerCycle?: number;
+  /** What crankEpochStep returns on its first call (then idle). */
+  stepResult?: Record<string, unknown>;
+  warn?: (msg: string, meta?: Record<string, unknown>) => void;
 }): {
   sm: EpochStateMachine;
   claimCalls: Array<{ gatewayAddress: string; delegatorAddress: string }>;
+  finalizeCalls: unknown[];
+  stepOpts: Array<Record<string, unknown>>;
 } {
   const claimCalls: Array<{
     gatewayAddress: string;
     delegatorAddress: string;
   }> = [];
+  const finalizeCalls: unknown[] = [];
+  const stepOpts: Array<Record<string, unknown>> = [];
+  let stepped = false;
   const overrides: Record<string, (...a: unknown[]) => unknown> = {
-    crankEpochStep: async () => ({ action: 'idle', reason: 'epoch_complete' }),
+    crankEpochStep: async (o: unknown) => {
+      stepOpts.push(o as Record<string, unknown>);
+      if (opts.stepResult && !stepped) {
+        stepped = true;
+        return opts.stepResult;
+      }
+      return { action: 'idle', reason: 'epoch_complete' };
+    },
     getArnsConfigRaw: async () => null,
+    getFinalizableGoneGateways: async () => [
+      { pubkey: 'GONE_PDA', operator: 'GONE_OP' },
+    ],
+    finalizeGone: async (params: unknown) => {
+      finalizeCalls.push(params);
+      return { id: 'tx' };
+    },
     getDisabledGatewaysWithDelegatedStake: async () => opts.disabledGateways,
     getGatewayDelegates: async (params: unknown) => {
       const address = (params as { address: string }).address;
@@ -245,15 +268,20 @@ function makeCleanupSM(opts: {
     batchSize: 25,
     enableCloseEpochs: true,
     epochRetention: 9,
-    enableCleanup: true,
+    enableCleanup: opts.enableCleanup ?? true,
     cleanupMinIntervalMs: 0,
     maxCleanupTxsPerCycle: opts.maxCleanupTxsPerCycle ?? 50,
     enableDisabledGatewaySweep: opts.enableDisabledGatewaySweep ?? true,
-    log: noopLog,
+    log: opts.warn ? { ...noopLog, warn: opts.warn } : noopLog,
     getEpochSettings: async () => enabledSettings,
     nameRegistryAccount: 'nameReg' as never,
   };
-  return { sm: new EpochStateMachine(config), claimCalls };
+  return {
+    sm: new EpochStateMachine(config),
+    claimCalls,
+    finalizeCalls,
+    stepOpts,
+  };
 }
 
 describe('EpochStateMachine.runCycle — draining multi-batch phases', () => {
@@ -372,67 +400,69 @@ describe('EpochStateMachine.runCycle — draining multi-batch phases', () => {
   });
 });
 
-describe('EpochStateMachine cleanup — disabled-gateway delegate sweep (Phase 8)', () => {
-  it('claims every delegate of each disabled gateway that still holds stake', async () => {
-    const { sm, claimCalls } = makeCleanupSM({
+describe('EpochStateMachine — gateway lifecycle is left to crankEpochStep', () => {
+  // ar-io/ar-io-sdk#756. finalize_gone only succeeds between distribution and
+  // create_epoch (ADR-0036), which cleanup never sees, and the old Phase 8
+  // claim never succeeded. crankEpochStep does both now.
+  it('cleanup never claims delegates or finalizes gateways itself', async () => {
+    const { sm, claimCalls, finalizeCalls } = makeCleanupSM({
       disabledGateways: [
         { pubkey: 'GW1_PDA', operator: 'OP1', totalDelegatedStake: 5n },
-        { pubkey: 'GW2_PDA', operator: 'OP2', totalDelegatedStake: 9n },
       ],
-      delegatesByGateway: {
-        OP1: ['DEL_A', 'DEL_B'],
-        OP2: ['DEL_C'],
+      delegatesByGateway: { OP1: ['DEL_A', 'DEL_B'] },
+    });
+    await runCycle(sm);
+    assert.equal(claimCalls.length, 0);
+    assert.equal(finalizeCalls.length, 0);
+  });
+
+  const optsFor = async (config: {
+    enableCleanup?: boolean;
+    enableDisabledGatewaySweep?: boolean;
+  }) => {
+    const { sm, stepOpts } = makeCleanupSM({
+      disabledGateways: [],
+      delegatesByGateway: {},
+      ...config,
+    });
+    await runCycle(sm);
+    return stepOpts[0];
+  };
+
+  it('turns on finalize_gone and the delegate sweep in crankEpochStep by default', async () => {
+    const o = await optsFor({});
+    assert.equal(o.enableFinalizeGone, true);
+    assert.equal(o.enableDelegateSweep, true);
+  });
+
+  it('ENABLE_DISABLED_GATEWAY_SWEEP=false turns off only the sweep', async () => {
+    const o = await optsFor({ enableDisabledGatewaySweep: false });
+    assert.equal(o.enableFinalizeGone, true);
+    assert.equal(o.enableDelegateSweep, false);
+  });
+
+  it('disabling cleanup turns both off', async () => {
+    const o = await optsFor({ enableCleanup: false });
+    assert.equal(o.enableFinalizeGone, false);
+    assert.equal(o.enableDelegateSweep, false);
+  });
+
+  it('logs a partial failure the step reports instead of dropping it', async () => {
+    const warnings: Array<Record<string, unknown> | undefined> = [];
+    const { sm } = makeCleanupSM({
+      disabledGateways: [],
+      delegatesByGateway: {},
+      stepResult: {
+        action: 'claim_delegate',
+        progress: { index: 0, total: 3 },
+        partialFailureReason: 'delegate sweep paused: signer balance below floor',
       },
+      warn: (_m, meta) => warnings.push(meta),
     });
     await runCycle(sm);
-
-    assert.equal(claimCalls.length, 3, 'must claim all 3 delegates across 2 gateways');
-    assert.deepEqual(claimCalls, [
-      { gatewayAddress: 'OP1', delegatorAddress: 'DEL_A' },
-      { gatewayAddress: 'OP1', delegatorAddress: 'DEL_B' },
-      { gatewayAddress: 'OP2', delegatorAddress: 'DEL_C' },
-    ]);
-  });
-
-  it('does nothing when the sweep is disabled by config', async () => {
-    const { sm, claimCalls } = makeCleanupSM({
-      disabledGateways: [
-        { pubkey: 'GW1_PDA', operator: 'OP1', totalDelegatedStake: 5n },
-      ],
-      delegatesByGateway: { OP1: ['DEL_A'] },
-      enableDisabledGatewaySweep: false,
-    });
-    await runCycle(sm);
-    assert.equal(claimCalls.length, 0, 'sweep must be skipped when disabled');
-  });
-
-  it('respects the per-cycle tx budget', async () => {
-    const { sm, claimCalls } = makeCleanupSM({
-      disabledGateways: [
-        { pubkey: 'GW1_PDA', operator: 'OP1', totalDelegatedStake: 5n },
-      ],
-      delegatesByGateway: { OP1: ['DEL_A', 'DEL_B', 'DEL_C', 'DEL_D'] },
-      maxCleanupTxsPerCycle: 2,
-    });
-    await runCycle(sm);
-    assert.equal(claimCalls.length, 2, 'must stop at the budget cap (2)');
-  });
-
-  it('skips already-drained (zero-balance) delegates', async () => {
-    const { sm, claimCalls } = makeCleanupSM({
-      disabledGateways: [
-        { pubkey: 'GW1_PDA', operator: 'OP1', totalDelegatedStake: 5n },
-      ],
-      delegatesByGateway: { OP1: ['DEL_A', 'DEL_DRAINED', 'DEL_B'] },
-      // DEL_DRAINED self-claimed earlier — amount already 0, must be skipped
-      // (claiming it would fail the on-chain `delegation.amount > 0` constraint).
-      delegateStakeByAddress: { DEL_DRAINED: 0 },
-    });
-    await runCycle(sm);
-    assert.deepEqual(claimCalls, [
-      { gatewayAddress: 'OP1', delegatorAddress: 'DEL_A' },
-      { gatewayAddress: 'OP1', delegatorAddress: 'DEL_B' },
-    ]);
+    assert.ok(
+      warnings.some((w) => String(w?.reason).includes('delegate sweep paused')),
+    );
   });
 });
 
