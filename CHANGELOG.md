@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- Move from Node.js 20 (end of life, no fix) to 22.23.4 for
+  CVE-2026-111497, a remote-code-execution bug in the Brotli decoder,
+  and the TLS hostname and `dns.resolve` fixes released with it on
+  2026-10-21. The cranker fetches over HTTPS from Solana RPC endpoints,
+  which may answer Brotli-compressed. The Docker image now pins the exact
+  Node patch version instead of the floating `node:20` tag.
+
 ## [0.1.0] — 2026-04-14
 
 Initial extraction from `ar-io/solana-ar-io@/cranker` as a standalone

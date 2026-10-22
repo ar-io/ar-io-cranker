@@ -44,6 +44,9 @@ Reference manifests in [`deploy/`](deploy/):
 
 ### Node (build from source)
 
+Requires Node.js 22.23.4 or later (`.nvmrc`); earlier releases carry
+CVE-2026-111497, a remote-code-execution bug in the Brotli decoder.
+
 ```bash
 yarn install   # requires GitHub Packages auth — see below
 yarn build
