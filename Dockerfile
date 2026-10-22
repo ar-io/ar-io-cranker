@@ -19,8 +19,13 @@
 # In GitHub Actions: pass `secrets: node_auth_token=${{ secrets.GITHUB_TOKEN }}`
 # to docker/build-push-action.
 
+# Exact patch pin, not a floating major: Node security fixes (CVE-2026-111497,
+# the Brotli decoder RCE fixed in 22.23.4) only reach the image when this
+# changes. Keep in step with .nvmrc.
+ARG NODE_VERSION=22.23.4
+
 # ---------- builder ----------
-FROM node:20-bookworm-slim AS builder
+FROM node:${NODE_VERSION}-bookworm-slim AS builder
 WORKDIR /build
 
 COPY package.json package-lock.json ./
@@ -48,7 +53,7 @@ RUN --mount=type=secret,id=node_auth_token \
     rm -f .npmrc
 
 # ---------- runtime ----------
-FROM node:20-bookworm-slim AS runtime
+FROM node:${NODE_VERSION}-bookworm-slim AS runtime
 WORKDIR /app
 
 # tini = PID 1 (forwards SIGTERM to Node so graceful shutdown fires).
